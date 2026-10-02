@@ -1,0 +1,28 @@
+{
+  "name": "voyagehub-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "test": "node --test",
+    "db:migrate": "node scripts/migrate.js",
+    "admin:promote": "node scripts/promote-admin.js",
+    "admin:demote": "node scripts/demote-admin.js",
+    "account:verify": "node scripts/verify-account.js"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "bcryptjs": "^3.0.2",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0",
+    "express-rate-limit": "^7.5.0",
+    "otplib": "^13.5.0",
+    "pg": "^8.13.1"
+  }
+}
