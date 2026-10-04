@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { config, countryList, currencyList, isCountryCode } from '../config/index.js';
-import { bookingStatuses, businessTypes, destinationKinds, documentScanStatuses, groupTypes, guestAccessActions, hotelCategories, legalDocumentTypes, mealPlans, memberRoles, offerInclusions, offerLineItemTypes, operationRunKinds, reportCategories, reportTargetTypes, requestVisibilities, serviceTypes, travellerTypes, verificationDocumentTypes, webhookDeliveryStatuses, webhookEventTypes } from '../config/referenceData.js';
+import { agencyVerificationStatuses, bookingChangeStatuses, bookingChangeTypes, bookingStatuses, businessTypes, destinationKinds, documentScanStatuses, groupTypes, guestAccessActions, hotelCategories, legalDocumentTypes, mealPlans, memberRoles, negotiationKinds, negotiationStatuses, offerInclusions, offerLineItemTypes, operationRunKinds, reportCategories, reportTargetTypes, requestVisibilities, serviceTypes, travellerTypes, verificationDocumentTypes, webhookDeliveryStatuses, webhookEventTypes } from '../config/referenceData.js';
 import { destinationDto, searchDestinations } from '../services/destinations.js';
 import { getMaxOffersPerRequest } from '../services/platformSettings.js';
 import { createRateLimiter } from '../utils/rateLimit.js';
@@ -26,6 +26,8 @@ export function createReferenceDataRouter({ pool, cookieName }) {
     services: serviceTypes,
     offerInclusions,
     offerLineItemTypes,
+    negotiationKinds,
+    negotiationStatuses,
     reportCategories,
     reportTargetTypes,
     requestVisibilities,
@@ -34,7 +36,10 @@ export function createReferenceDataRouter({ pool, cookieName }) {
     legalDocumentTypes,
     verificationDocumentTypes,
     documentScanStatuses,
+    agencyVerificationStatuses,
     bookingStatuses,
+    bookingChangeTypes,
+    bookingChangeStatuses,
     travellerTypes,
     guestAccessActions,
     webhookEventTypes,
@@ -75,9 +80,16 @@ export function createReferenceDataRouter({ pool, cookieName }) {
           offerValidity: config.offerValidity,
           invitationTtlHours: config.invitationTtlHours,
           maxOfferLineItems: config.maxOfferLineItems,
+          maxOfferOptions: config.maxOfferOptions,
+          maxNegotiationRoundsPerOffer: config.maxNegotiationRoundsPerOffer,
+          maxAwardsPerRequest: config.awards.maxPerRequest,
+          awardUndoWindowMinutes: config.awards.undoWindowMs / 60000,
+          bookingChanges: config.bookingChanges,
           maxCoverageDestinations: config.maxCoverageDestinations,
           documentUpload: { maxBytes: config.documents.maxBytes, allowedMimeTypes: config.documents.allowedMimeTypes },
           maxVouchersPerBooking: config.bookings.maxVouchersPerBooking,
+          maxOfferAttachments: config.attachments.maxPerOffer,
+          maxMessageAttachmentsPerConversation: config.attachments.maxPerConversation,
         },
       });
     } catch (error) {

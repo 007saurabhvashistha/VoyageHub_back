@@ -1,11 +1,12 @@
 import { randomBytes, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { Router } from 'express';
 import { loadSession, requireActiveAccount, requireCsrf, requireMfaForPlatformAdmin } from './auth.routes.js';
 import { getMaxOffersPerRequest } from '../services/platformSettings.js';
 import { requireCapability } from '../services/permissions.js';
 import { config, isCurrencyCode } from '../config/index.js';
 import { capabilities, groupTypes as groupTypeOptions, hotelCategories, mealPlans as mealPlanOptions, requestVisibilities, serviceTypes as serviceOptions, valuesOf } from '../config/referenceData.js';
-import { loadLineItems, offerPricingDto, offerSchemaFor, offerTermsDto, replaceLineItems } from '../services/offerInput.js';
+import { loadLineItems, loadOptions, offerOptionDto, offerPricingDto, offerSchemaFor, offerTermsDto, replaceLineItems, replaceOptions } from '../services/offerInput.js';
 import { contactDetailsPattern, containsContactDetails } from '../utils/contactDetails.js';
 import { parseWith } from '../utils/validation.js';
 import { createRateLimiter } from '../utils/rateLimit.js';
@@ -13,6 +14,9 @@ import { z } from 'zod';
 import { reportCategories, reportTargetTypes } from '../config/referenceData.js';
 import { findDestination, sellerMatchesRequestDestination, sellerProfileResponse } from '../services/destinations.js';
 import { organizationIsActive } from '../services/organizationLifecycle.js';
+import { declineSchema, listNegotiations, loadOpenNegotiations, negotiationDto, negotiationSchema } from '../services/offerNegotiations.js';
+import { findConversation, sellerCanSeeRequest } from '../services/requestConversations.js';
+import { loadAttachments } from '../services/marketplaceAttachments.js';
 
 const reportSchema = z.object({
   target_type: z.enum(reportTargetTypes.map((item) => item.value), { error: 'Choose what you are reporting.' }),
@@ -29,12 +33,6 @@ const visibilities = valuesOf(requestVisibilities);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const hourMs = 60 * 60 * 1000;
 const dayMs = 24 * hourMs;
-// Closed requests stay visible to sellers whose offer is still under review.
-const sellerCanSeeRequest = `(r.status = 'open'
-  OR (r.status = 'closed' AND EXISTS (SELECT 1 FROM offers own WHERE own.request_id = r.id
-    AND own.seller_organization_id = t.seller_organization_id AND own.status IN ('submitted', 'shortlisted')))
-  OR (r.status = 'awarded' AND EXISTS (SELECT 1 FROM awards a WHERE a.request_id = r.id
-    AND a.seller_organization_id = t.seller_organization_id)))`;
 
 function fail(response, status, code, message) {
   return response.status(status).json({ error: { code, message } });
@@ -47,7 +45,7 @@ async function notify(pool, organizationId, eventType, title, message, data) {
   );
 }
 
-function offerDto(row, { lineItems = [], request, sellerName } = {}) {
+function offerDto(row, { lineItems = [], options = [], attachments = [], openNegotiation = null, request, sellerName } = {}) {
   const minor = (value) => value == null ? null : Number(value);
   return {
     id: row.id,
@@ -59,6 +57,8 @@ function offerDto(row, { lineItems = [], request, sellerName } = {}) {
     ratePerNightMinor: minor(row.rate_per_night_minor),
     roomType: row.room_type,
     mealPlan: row.meal_plan,
+    hotelCategory: row.hotel_category ?? null,
+    optionLabel: row.option_label ?? null,
     currency: row.currency,
     inclusions: row.inclusions,
     exclusions: row.exclusions,
@@ -66,11 +66,38 @@ function offerDto(row, { lineItems = [], request, sellerName } = {}) {
     status: row.status,
     outcomeReason: row.outcome_reason ?? null,
     createdAt: row.created_at,
+    confirmedTripVersion: Number(row.confirmed_trip_version ?? 1),
+    reconfirmedAt: row.reconfirmed_at ?? null,
+    ...(request?.trip_version != null ? { needsReconfirmation: Number(row.confirmed_trip_version ?? 1) < Number(request.trip_version) } : {}),
     ...offerTermsDto(row),
     ...(request ? offerPricingDto(row, request) : {}),
     lineItems,
+    options: options.map((option) => offerOptionDto(option, row, request)),
+    attachments,
+    openNegotiation,
   };
 }
+
+// Line items, alternative options, attachments and the open negotiation per offer id; read one after the other so a single client is safe.
+async function loadOfferParts(db, offerIds) {
+  const lineItems = await loadLineItems(db, offerIds);
+  const options = await loadOptions(db, offerIds);
+  const attachments = await loadAttachments(db, 'offer', offerIds);
+  const negotiations = await loadOpenNegotiations(db, offerIds);
+  return (offerId) => ({ lineItems: lineItems.get(offerId), options: options.get(offerId), attachments: attachments.get(offerId), openNegotiation: negotiations.get(offerId) ?? null });
+}
+
+// Stores the offer as it was before a change, so "which version was awarded" can always be answered.
+async function recordOfferRevision(client, offerRow, requestFacts) {
+  const parts = await loadOfferParts(client, [offerRow.id]);
+  const latest = await client.query('SELECT COALESCE(MAX(revision_number), 0) AS revision_number FROM offer_revisions WHERE offer_id = $1', [offerRow.id]);
+  await client.query(
+    'INSERT INTO offer_revisions (id, offer_id, revision_number, snapshot) VALUES ($1, $2, $3, $4)',
+    [randomUUID(), offerRow.id, Number(latest.rows[0].revision_number) + 1, JSON.stringify(offerDto(offerRow, { ...parts(offerRow.id), request: requestFacts }))],
+  );
+}
+
+const requestFactsOf = (row) => ({ adults: row.adults, children: row.children, nights: row.nights, room_count: row.request_room_count, trip_version: row.trip_version });
 
 function validDate(value) {
   return typeof value === 'string'
@@ -79,24 +106,22 @@ function validDate(value) {
     && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
 }
 
-function validRequest(body) {
-  const destinationId = typeof body.destination_id === 'string' ? body.destination_id : '';
+// null when omitted, undefined when malformed.
+function parseTripVersion(value) {
+  if (value == null) return null;
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+// Trip details are the fields an agency may change after publishing; sellers must re-confirm when they do.
+function validTrip(body) {
   const travelMonth = typeof body.travel_month === 'string' ? body.travel_month : null;
   const hasDates = validDate(body.travel_start_date) && validDate(body.travel_end_date) && body.travel_end_date > body.travel_start_date;
   const hasMonth = typeof travelMonth === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(travelMonth);
-  const services = Array.isArray(body.services) ? [...new Set(body.services)] : [];
   const nights = Number(body.nights);
   const adults = Number(body.adults);
   const children = Number(body.children ?? 0);
   const infants = Number(body.infants ?? 0);
-  const responseDeadline = typeof body.response_deadline === 'string' ? new Date(body.response_deadline) : null;
-  const budgetMin = body.budget_min_minor == null ? null : Number(body.budget_min_minor);
-  const budgetMax = body.budget_max_minor == null ? null : Number(body.budget_max_minor);
-  const budgetCurrency = typeof body.budget_currency === 'string' ? body.budget_currency.toUpperCase() : null;
-  const visibility = body.visibility ?? 'open';
-  const invitedSellerIds = Array.isArray(body.invited_seller_ids) ? [...new Set(body.invited_seller_ids)] : [];
 
-  if (!uuidPattern.test(destinationId)) return { error: 'Choose a destination from the destination list.' };
   if (!hasDates && !hasMonth) return { error: 'Provide exact travel dates or a travel month.' };
   if (hasDates && travelMonth) return { error: 'Choose exact dates or a travel month, not both.' };
   if (!Number.isInteger(nights) || nights < 1 || nights > 90) return { error: 'Nights must be between 1 and 90.' };
@@ -104,16 +129,48 @@ function validRequest(body) {
   if (!Number.isInteger(adults) || adults < 1 || adults > 100) return { error: 'Adults must be between 1 and 100.' };
   if (!Number.isInteger(children) || children < 0 || children > 80) return { error: 'Children must be between 0 and 80.' };
   if (!Number.isInteger(infants) || infants < 0 || infants > 40) return { error: 'Infants must be between 0 and 40.' };
+  if (body.room_count != null && (!Number.isInteger(Number(body.room_count)) || Number(body.room_count) < 1 || Number(body.room_count) > 50)) return { error: 'Room count must be between 1 and 50.' };
+
+  return {
+    travelStartDate: hasDates ? body.travel_start_date : null,
+    travelEndDate: hasDates ? body.travel_end_date : null,
+    travelMonth: hasMonth ? travelMonth : null,
+    nights,
+    adults,
+    children,
+    infants,
+    roomCount: body.room_count == null ? null : Number(body.room_count),
+  };
+}
+
+function validDeadline(value) {
+  const deadline = typeof value === 'string' ? new Date(value) : null;
+  if (!deadline || Number.isNaN(deadline.getTime())
+    || deadline < new Date(Date.now() + config.requestDeadline.minHours * hourMs)
+    || deadline > new Date(Date.now() + config.requestDeadline.maxDays * dayMs)) {
+    return { error: `Response deadline must be between ${config.requestDeadline.minHours} hour(s) and ${config.requestDeadline.maxDays} days from now.` };
+  }
+  return { deadline };
+}
+
+function validRequest(body) {
+  const destinationId = typeof body.destination_id === 'string' ? body.destination_id : '';
+  const services = Array.isArray(body.services) ? [...new Set(body.services)] : [];
+  const budgetMin = body.budget_min_minor == null ? null : Number(body.budget_min_minor);
+  const budgetMax = body.budget_max_minor == null ? null : Number(body.budget_max_minor);
+  const budgetCurrency = typeof body.budget_currency === 'string' ? body.budget_currency.toUpperCase() : null;
+  const visibility = body.visibility ?? 'open';
+  const invitedSellerIds = Array.isArray(body.invited_seller_ids) ? [...new Set(body.invited_seller_ids)] : [];
+
+  if (!uuidPattern.test(destinationId)) return { error: 'Choose a destination from the destination list.' };
+  const trip = validTrip(body);
+  if (trip.error) return trip;
   if (!groupTypes.has(body.group_type)) return { error: 'Choose a supported group type.' };
   if (!services.length || services.length > serviceTypes.size || services.some((service) => !serviceTypes.has(service))) return { error: 'Choose one or more supported services.' };
   if (body.hotel_category != null && !hotelCategoryValues.has(Number(body.hotel_category))) return { error: 'Choose a supported hotel category.' };
-  if (body.room_count != null && (!Number.isInteger(Number(body.room_count)) || Number(body.room_count) < 1 || Number(body.room_count) > 50)) return { error: 'Room count must be between 1 and 50.' };
   if (body.meal_plan != null && !mealPlans.has(body.meal_plan)) return { error: 'Choose a supported meal plan.' };
-  if (!responseDeadline || Number.isNaN(responseDeadline.getTime())
-    || responseDeadline < new Date(Date.now() + config.requestDeadline.minHours * hourMs)
-    || responseDeadline > new Date(Date.now() + config.requestDeadline.maxDays * dayMs)) {
-    return { error: `Response deadline must be between ${config.requestDeadline.minHours} hour(s) and ${config.requestDeadline.maxDays} days from now.` };
-  }
+  const deadline = validDeadline(body.response_deadline);
+  if (deadline.error) return deadline;
   if ((budgetMin == null) !== (budgetMax == null)) return { error: 'Provide both budget bounds or neither.' };
   if (budgetMin != null && (!Number.isSafeInteger(budgetMin) || !Number.isSafeInteger(budgetMax) || budgetMin < 0 || budgetMax < budgetMin || !isCurrencyCode(budgetCurrency))) return { error: 'Budget requires valid minor-unit bounds and an ISO currency code.' };
   if (!visibilities.has(visibility)) return { error: 'Choose open, invite-only, or open and invited visibility.' };
@@ -123,34 +180,71 @@ function validRequest(body) {
 
   return {
     destinationId,
-    travelStartDate: hasDates ? body.travel_start_date : null,
-    travelEndDate: hasDates ? body.travel_end_date : null,
-    travelMonth: hasMonth ? travelMonth : null,
-    nights,
-    adults,
-    children,
-    infants,
+    ...trip,
     groupType: body.group_type,
     hotelCategory: body.hotel_category == null ? null : Number(body.hotel_category),
-    roomCount: body.room_count == null ? null : Number(body.room_count),
     mealPlan: body.meal_plan ?? null,
     services,
     budgetMin,
     budgetMax,
     budgetCurrency: budgetMin == null ? null : budgetCurrency,
-    responseDeadline,
+    responseDeadline: deadline.deadline,
     visibility,
     invitedSellerIds,
   };
 }
 
+const dateText = (value) => value instanceof Date ? value.toISOString().slice(0, 10) : value ?? null;
+
+function travellersText(adults, children, infants) {
+  const parts = [`${adults} adults`];
+  if (children) parts.push(`${children} children`);
+  if (infants) parts.push(`${infants} infants`);
+  return parts.join(', ');
+}
+
+// Stored in request_trip_changes and compared to detect a real change.
+function tripFields(row) {
+  return {
+    travel_start_date: dateText(row.travel_start_date),
+    travel_end_date: dateText(row.travel_end_date),
+    travel_month: row.travel_month ?? null,
+    nights: Number(row.nights),
+    adults: Number(row.adults),
+    children: Number(row.children ?? 0),
+    infants: Number(row.infants ?? 0),
+    room_count: row.room_count == null ? null : Number(row.room_count),
+  };
+}
+
+function tripDto(trip) {
+  return {
+    travelStartDate: trip.travel_start_date,
+    travelEndDate: trip.travel_end_date,
+    travelMonth: trip.travel_month,
+    dates: trip.travel_start_date && trip.travel_end_date ? `${trip.travel_start_date} - ${trip.travel_end_date}` : trip.travel_month,
+    nights: trip.nights,
+    adults: trip.adults,
+    children: trip.children,
+    infants: trip.infants,
+    travelers: travellersText(trip.adults, trip.children, trip.infants),
+    roomCount: trip.room_count,
+  };
+}
+
+function tripChangeDto(row) {
+  return {
+    version: row.trip_version,
+    changedAt: row.created_at,
+    note: row.note,
+    previous: tripDto(row.previous_trip),
+    current: tripDto(row.current_trip),
+  };
+}
+
 function requestDto(row) {
-  const dateText = (value) => value instanceof Date ? value.toISOString().slice(0, 10) : value;
   const startDate = row.travel_start_date ? dateText(row.travel_start_date) : null;
   const endDate = row.travel_end_date ? dateText(row.travel_end_date) : null;
-  const travelerParts = [`${row.adults} adults`];
-  if (row.children) travelerParts.push(`${row.children} children`);
-  if (row.infants) travelerParts.push(`${row.infants} infants`);
   return {
     id: row.id,
     requestCode: row.request_code,
@@ -166,7 +260,7 @@ function requestDto(row) {
     adults: row.adults,
     children: row.children,
     infants: row.infants,
-    travelers: travelerParts.join(', '),
+    travelers: travellersText(row.adults, row.children, row.infants),
     groupType: row.group_type,
     hotelCategory: row.hotel_category,
     roomCount: row.room_count,
@@ -183,13 +277,71 @@ function requestDto(row) {
     offers: Number(row.offer_count ?? 0),
     agencyName: row.agency_name,
     agencyVerified: Boolean(row.agency_verified),
+    tripVersion: Number(row.trip_version ?? 1),
+    tripChangedAt: row.trip_changed_at ?? null,
+    awardedAt: row.awarded_at ?? null,
+    awardUndoUntil: row.awarded_at && row.award_undoable ? new Date(new Date(row.awarded_at).getTime() + config.awards.undoWindowMs).toISOString() : null,
   };
 }
 
 function sellerRequestDto(row, offerLimit) {
   const offers = Number(row.offer_count ?? 0);
-  return { ...requestDto(row), offerLimit, offerLimitReached: offers >= offerLimit, hasActiveOffer: Boolean(row.has_active_offer) };
+  return {
+    ...requestDto(row),
+    offerLimit,
+    offerLimitReached: offers >= offerLimit,
+    hasActiveOffer: Boolean(row.my_offer_id),
+    myOfferId: row.my_offer_id ?? null,
+    needsReconfirmation: Boolean(row.needs_reconfirmation),
+    tripChange: row.last_change_version ? tripChangeDto({ trip_version: row.last_change_version, created_at: row.last_change_at, note: row.last_change_note, previous_trip: row.last_change_previous, current_trip: row.last_change_current }) : null,
+  };
 }
+
+// Only allowlisted fields reach sellers; rebuilt whenever published trip details change.
+const refreshSellerSnapshotSql = `UPDATE marketplace_requests r SET seller_visible_snapshot = jsonb_build_object(
+    'requestCode', r.request_code, 'destination', r.destination,
+    'destinationCountry', r.destination_country, 'travelStartDate', r.travel_start_date,
+    'travelEndDate', r.travel_end_date, 'travelMonth', r.travel_month,
+    'nights', r.nights, 'adults', r.adults, 'children', r.children, 'infants', r.infants,
+    'groupType', r.group_type, 'hotelCategory', r.hotel_category, 'roomCount', r.room_count,
+    'mealPlan', r.meal_plan, 'services', r.services, 'budgetMinMinor', r.budget_min_minor,
+    'budgetMaxMinor', r.budget_max_minor, 'budgetCurrency', r.budget_currency,
+    'responseDeadline', r.response_deadline, 'agencyName', o.name,
+    'agencyVerified', (o.verified_at IS NOT NULL),
+    'tripVersion', r.trip_version, 'tripChangedAt', r.trip_changed_at
+  ) FROM organizations o WHERE r.id = $1 AND o.id = r.agency_organization_id`;
+
+const tripChangeSchema = z.object({
+  response_deadline: z.string().nullish().transform((value) => value || null),
+  note: z.string().trim().max(500, 'Keep the change note under 500 characters.').nullish().transform((value) => value || null),
+  trip_version: z.number({ error: 'Send the trip version you are changing.' }).int().positive(),
+});
+
+const awardSelectionSchema = z.object({
+  offer_id: z.uuid('Choose an offer to award.'),
+  offer_option_id: z.uuid('Choose a valid offer option, or leave it empty for the main option.').nullish().transform((value) => value ?? null),
+});
+
+// `offer_id` alone awards one seller; `selections` splits the trip across several sellers in one decision.
+const awardSchema = z.object({
+  selections: z.array(awardSelectionSchema).min(1, 'Choose an offer to award.')
+    .max(config.awards.maxPerRequest, `Award at most ${config.awards.maxPerRequest} sellers on one request.`).optional(),
+  offer_id: z.uuid('Choose an offer to award.').optional(),
+  offer_option_id: z.uuid('Choose a valid offer option, or leave it empty for the main option.').nullish(),
+  not_selected_reason: z.string().trim().max(300, 'Keep the not-selected reason under 300 characters.').nullish().transform((value) => value || null),
+}).transform((input) => ({
+  selections: input.selections ?? (input.offer_id ? [{ offer_id: input.offer_id, offer_option_id: input.offer_option_id ?? null }] : []),
+  notSelectedReason: input.not_selected_reason,
+})).refine((input) => input.selections.length > 0, 'Choose an offer to award.')
+  .refine((input) => new Set(input.selections.map((item) => item.offer_id)).size === input.selections.length, 'Choose each offer only once.');
+
+const undoAwardSchema = z.object({
+  reason: z.string().trim().max(300, 'Keep the reason under 300 characters.').nullish().transform((value) => value || null),
+}).refine((input) => !containsContactDetails(input.reason), 'Remove contact details and external links from the reason.');
+
+// An award decision can be undone only while every award in it is still before booking confirmation.
+const agencyAwardColumns = `(SELECT MIN(a.created_at) FROM awards a WHERE a.request_id = r.id) AS awarded_at,
+  NOT EXISTS (SELECT 1 FROM awards a WHERE a.request_id = r.id AND a.status <> 'awarded') AS award_undoable`;
 
 export function createMarketplaceRouter({ pool }) {
   const router = Router();
@@ -322,7 +474,7 @@ export function createMarketplaceRouter({ pool }) {
     try {
       if (request.auth.business_type === 'agency') {
         const result = await pool.query(
-            `SELECT r.*, o.name AS agency_name, o.verified_at IS NOT NULL AS agency_verified,
+            `SELECT r.*, o.name AS agency_name, o.verified_at IS NOT NULL AS agency_verified, ${agencyAwardColumns},
               (SELECT COUNT(*) FROM offers f JOIN seller_profiles p ON p.organization_id = f.seller_organization_id
                WHERE f.request_id = r.id AND p.verification_status = 'approved' AND f.status IN ('submitted', 'shortlisted', 'accepted')) AS offer_count
            FROM marketplace_requests r JOIN organizations o ON o.id = r.agency_organization_id
@@ -335,18 +487,26 @@ export function createMarketplaceRouter({ pool }) {
         `SELECT r.*, o.name AS agency_name, o.verified_at IS NOT NULL AS agency_verified,
           (SELECT COUNT(*) FROM offers f JOIN seller_profiles p ON p.organization_id = f.seller_organization_id
            WHERE f.request_id = r.id AND p.verification_status = 'approved' AND f.status IN ('submitted', 'shortlisted', 'accepted')) AS offer_count,
-          EXISTS (SELECT 1 FROM offers mine WHERE mine.request_id = r.id AND mine.seller_organization_id = t.seller_organization_id
-            AND mine.status IN ('submitted', 'shortlisted', 'accepted')) AS has_active_offer
+          mine.id AS my_offer_id,
+          (mine.id IS NOT NULL AND mine.status <> 'accepted' AND mine.confirmed_trip_version < r.trip_version) AS needs_reconfirmation,
+          change.trip_version AS last_change_version, change.created_at AS last_change_at, change.note AS last_change_note,
+          change.previous_trip AS last_change_previous, change.current_trip AS last_change_current
          FROM request_targets t
          JOIN marketplace_requests r ON r.id = t.request_id
          JOIN organizations o ON o.id = r.agency_organization_id
+         LEFT JOIN LATERAL (SELECT f.id, f.status, f.confirmed_trip_version FROM offers f
+           WHERE f.request_id = r.id AND f.seller_organization_id = t.seller_organization_id
+             AND f.status IN ('submitted', 'shortlisted', 'accepted') LIMIT 1) mine ON TRUE
+         LEFT JOIN LATERAL (SELECT c.trip_version, c.created_at, c.note, c.previous_trip, c.current_trip FROM request_trip_changes c
+           WHERE c.request_id = r.id ORDER BY c.trip_version DESC LIMIT 1) change ON TRUE
          WHERE t.seller_organization_id = $1 AND t.declined_at IS NULL
            AND ${sellerCanSeeRequest}
          ORDER BY r.response_deadline ASC`,
         [request.auth.organization_id],
       );
       const offerLimit = await getMaxOffersPerRequest(pool);
-      return response.json({ requests: result.rows.map((row) => sellerRequestDto(row, offerLimit)) });
+      const negotiations = await loadOpenNegotiations(pool, result.rows.map((row) => row.my_offer_id).filter(Boolean));
+      return response.json({ requests: result.rows.map((row) => ({ ...sellerRequestDto(row, offerLimit), openNegotiation: negotiations.get(row.my_offer_id) ?? null })) });
     } catch (error) {
       return next(error);
     }
@@ -356,7 +516,7 @@ export function createMarketplaceRouter({ pool }) {
     try {
       if (request.auth.business_type === 'agency') {
         const result = await pool.query(
-          `SELECT r.*, o.name AS agency_name, o.verified_at IS NOT NULL AS agency_verified,
+          `SELECT r.*, o.name AS agency_name, o.verified_at IS NOT NULL AS agency_verified, ${agencyAwardColumns},
                   (SELECT COUNT(*) FROM offers f JOIN seller_profiles p ON p.organization_id = f.seller_organization_id
                    WHERE f.request_id = r.id AND p.verification_status = 'approved' AND f.status IN ('submitted', 'shortlisted', 'accepted')) AS offer_count
            FROM marketplace_requests r JOIN organizations o ON o.id = r.agency_organization_id
@@ -370,17 +530,21 @@ export function createMarketplaceRouter({ pool }) {
            WHERE i.request_id = $1 ORDER BY o.name`,
           [request.params.requestId],
         );
-        return response.json({ request: { ...requestDto(result.rows[0]), invitedSellers: invited.rows.map((row) => ({ organizationId: row.id, name: row.name, type: row.business_type })) } });
+        const changes = await pool.query('SELECT * FROM request_trip_changes WHERE request_id = $1 ORDER BY trip_version DESC', [request.params.requestId]);
+        return response.json({ request: { ...requestDto(result.rows[0]), invitedSellers: invited.rows.map((row) => ({ organizationId: row.id, name: row.name, type: row.business_type })), tripChanges: changes.rows.map(tripChangeDto) } });
       }
       const result = await pool.query(
-        `SELECT r.seller_visible_snapshot FROM request_targets t
+        `SELECT r.seller_visible_snapshot, change.* FROM request_targets t
          JOIN marketplace_requests r ON r.id = t.request_id
+         LEFT JOIN LATERAL (SELECT c.trip_version, c.created_at, c.note, c.previous_trip, c.current_trip FROM request_trip_changes c
+           WHERE c.request_id = r.id ORDER BY c.trip_version DESC LIMIT 1) change ON TRUE
          WHERE t.request_id = $1 AND t.seller_organization_id = $2 AND t.declined_at IS NULL
            AND ${sellerCanSeeRequest}`,
         [request.params.requestId, request.auth.organization_id],
       );
       if (!result.rowCount) return fail(response, 404, 'REQUEST_NOT_AVAILABLE', 'This request is not available to your organization.');
-      return response.json({ request: result.rows[0].seller_visible_snapshot });
+      const row = result.rows[0];
+      return response.json({ request: { ...row.seller_visible_snapshot, tripChange: row.trip_version ? tripChangeDto(row) : null } });
     } catch (error) {
       return next(error);
     }
@@ -392,26 +556,12 @@ export function createMarketplaceRouter({ pool }) {
       : request.auth.organization_id;
     if (!/^[0-9a-f-]{36}$/i.test(sellerOrganizationId ?? '')) return fail(response, 400, 'VALIDATION_ERROR', 'Choose a matched seller conversation.');
     try {
-      const conversation = await pool.query(
-        `SELECT r.request_code, r.agency_organization_id, r.status, a.seller_organization_id AS awarded_seller_id,
-                seller.id AS seller_organization_id, seller.name AS seller_name, agency.name AS agency_name
-         FROM marketplace_requests r
-         JOIN request_targets t ON t.request_id = r.id AND t.seller_organization_id = $2 AND t.declined_at IS NULL
-         JOIN organizations seller ON seller.id = t.seller_organization_id
-         JOIN organizations agency ON agency.id = r.agency_organization_id
-         LEFT JOIN awards a ON a.request_id = r.id
-         WHERE r.id = $1
-           AND ($3 = r.agency_organization_id OR $3 = t.seller_organization_id)
-           AND ${sellerCanSeeRequest}`,
-        [request.params.requestId, sellerOrganizationId, request.auth.organization_id],
-      );
-      if (!conversation.rowCount) return fail(response, 404, 'CONVERSATION_NOT_FOUND', 'This request conversation is not available to your organization.');
+      const participant = await findConversation(pool, { requestId: request.params.requestId, sellerOrganizationId, organizationId: request.auth.organization_id });
+      if (!participant) return fail(response, 404, 'CONVERSATION_NOT_FOUND', 'This request conversation is not available to your organization.');
       const limit = Number(request.query.limit ?? 100);
       const offset = Number(request.query.offset ?? 0);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100 || !Number.isInteger(offset) || offset < 0 || offset > 10000) return fail(response, 400, 'VALIDATION_ERROR', 'Choose valid message pagination values.');
-      const participant = conversation.rows[0];
-      const agencyIsSender = request.auth.organization_id === participant.agency_organization_id;
-      const peerOrganizationId = agencyIsSender ? participant.seller_organization_id : participant.agency_organization_id;
+      const { peerOrganizationId } = participant;
       const [count, messages] = await Promise.all([
         pool.query(
           `SELECT COUNT(*) AS total FROM request_messages
@@ -430,10 +580,11 @@ export function createMarketplaceRouter({ pool }) {
           [request.params.requestId, request.auth.organization_id, peerOrganizationId, limit, offset],
         ),
       ]);
+      const attachments = await loadAttachments(pool, 'message', messages.rows.map((message) => message.id));
       return response.json({
         requestCode: participant.request_code,
-        peerName: agencyIsSender ? participant.seller_name : participant.agency_name,
-        messages: messages.rows.map((message) => ({ id: message.id, senderName: message.sender_name, body: message.body, createdAt: message.created_at, isMine: message.sender_organization_id === request.auth.organization_id })),
+        peerName: participant.peerName,
+        messages: messages.rows.map((message) => ({ id: message.id, senderName: message.sender_name, body: message.body, createdAt: message.created_at, isMine: message.sender_organization_id === request.auth.organization_id, attachments: attachments.get(message.id) ?? [] })),
         pagination: { limit, offset, total: Number(count.rows[0].total) },
       });
     } catch (error) {
@@ -453,37 +604,22 @@ export function createMarketplaceRouter({ pool }) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      const conversation = await client.query(
-        `SELECT r.request_code, r.agency_organization_id, r.status, a.seller_organization_id AS awarded_seller_id,
-                seller.id AS seller_organization_id, agency.name AS agency_name, seller.name AS seller_name
-         FROM marketplace_requests r
-         JOIN request_targets t ON t.request_id = r.id AND t.seller_organization_id = $2 AND t.declined_at IS NULL
-         JOIN organizations seller ON seller.id = t.seller_organization_id
-         JOIN organizations agency ON agency.id = r.agency_organization_id
-         LEFT JOIN awards a ON a.request_id = r.id
-         WHERE r.id = $1
-           AND ($3 = r.agency_organization_id OR $3 = t.seller_organization_id)
-           AND ${sellerCanSeeRequest}
-         FOR UPDATE OF r`,
-        [request.params.requestId, sellerOrganizationId, request.auth.organization_id],
-      );
-      if (!conversation.rowCount) {
+      const participant = await findConversation(client, { requestId: request.params.requestId, sellerOrganizationId, organizationId: request.auth.organization_id, lock: true });
+      if (!participant) {
         await client.query('ROLLBACK');
         return fail(response, 404, 'CONVERSATION_NOT_FOUND', 'This request conversation is not available to your organization.');
       }
-      const participant = conversation.rows[0];
-      const agencyIsSender = request.auth.organization_id === participant.agency_organization_id;
-      const recipientOrganizationId = agencyIsSender ? participant.seller_organization_id : participant.agency_organization_id;
+      const recipientOrganizationId = participant.peerOrganizationId;
       const messageId = randomUUID();
       await client.query(
         `INSERT INTO request_messages (id, request_id, sender_organization_id, recipient_organization_id, sender_user_id, body)
          VALUES ($1, $2, $3, $4, $5, $6)`,
         [messageId, request.params.requestId, request.auth.organization_id, recipientOrganizationId, request.auth.user_id, body],
       );
-      const senderName = agencyIsSender ? participant.agency_name : participant.seller_name;
+      const senderName = participant.callerName;
       await notify(client, recipientOrganizationId, 'request_message', 'New marketplace message', `${participant.request_code} / New message from ${senderName}`, { requestId: request.params.requestId, requestCode: participant.request_code, messageId });
       await client.query('COMMIT');
-      return response.status(201).json({ message: { id: messageId, requestId: request.params.requestId, senderName, body, createdAt: new Date().toISOString(), isMine: true } });
+      return response.status(201).json({ message: { id: messageId, requestId: request.params.requestId, senderName, body, createdAt: new Date().toISOString(), isMine: true, attachments: [] } });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       return next(error);
@@ -604,20 +740,7 @@ export function createMarketplaceRouter({ pool }) {
          ON CONFLICT DO NOTHING RETURNING seller_organization_id`,
         [row.id, request.auth.organization_id],
       );
-      await client.query(
-        `UPDATE marketplace_requests r SET seller_visible_snapshot = jsonb_build_object(
-           'requestCode', r.request_code, 'destination', r.destination,
-           'destinationCountry', r.destination_country, 'travelStartDate', r.travel_start_date,
-           'travelEndDate', r.travel_end_date, 'travelMonth', r.travel_month,
-           'nights', r.nights, 'adults', r.adults, 'children', r.children, 'infants', r.infants,
-           'groupType', r.group_type, 'hotelCategory', r.hotel_category, 'roomCount', r.room_count,
-           'mealPlan', r.meal_plan, 'services', r.services, 'budgetMinMinor', r.budget_min_minor,
-           'budgetMaxMinor', r.budget_max_minor, 'budgetCurrency', r.budget_currency,
-           'responseDeadline', r.response_deadline, 'agencyName', o.name,
-           'agencyVerified', (o.verified_at IS NOT NULL)
-         ) FROM organizations o WHERE r.id = $1 AND o.id = r.agency_organization_id`,
-        [row.id],
-      );
+      await client.query(refreshSellerSnapshotSql, [row.id]);
       for (const target of targets.rows) {
         await notify(client, target.seller_organization_id, 'request_matched', 'New matching request', `${row.request_code} / ${row.destination} / ${row.nights} nights`, { requestId: row.id, requestCode: row.request_code, destination: row.destination });
       }
@@ -643,6 +766,95 @@ export function createMarketplaceRouter({ pool }) {
       return response.json({ requestId: result.rows[0].id, requestCode: result.rows[0].request_code, status: 'closed' });
     } catch (error) {
       return next(error);
+    }
+  });
+
+  router.patch('/requests/:requestId/trip', requireCapability(capabilities.requestWrite), async (request, response, next) => {
+    if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the owning agency can change trip details.');
+    if (!uuidPattern.test(request.params.requestId)) return fail(response, 404, 'REQUEST_NOT_FOUND', 'Request was not found.');
+    const meta = parseWith(tripChangeSchema, request.body);
+    if (meta.error) return fail(response, 400, 'VALIDATION_ERROR', meta.error);
+    const trip = validTrip(request.body ?? {});
+    if (trip.error) return fail(response, 400, 'VALIDATION_ERROR', trip.error);
+    const requestedDeadline = meta.data.response_deadline ? validDeadline(meta.data.response_deadline) : null;
+    if (requestedDeadline?.error) return fail(response, 400, 'VALIDATION_ERROR', requestedDeadline.error);
+    if (containsContactDetails(meta.data.note)) return fail(response, 400, 'CONTACT_DETAILS_NOT_ALLOWED', 'Remove contact details and external links from the change note.');
+    const nextTrip = {
+      travel_start_date: trip.travelStartDate,
+      travel_end_date: trip.travelEndDate,
+      travel_month: trip.travelMonth,
+      nights: trip.nights,
+      adults: trip.adults,
+      children: trip.children,
+      infants: trip.infants,
+      room_count: trip.roomCount,
+    };
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const current = await client.query(
+        `SELECT *, travel_start_date::text AS start_text, travel_end_date::text AS end_text
+         FROM marketplace_requests WHERE id = $1 AND agency_organization_id = $2 FOR UPDATE`,
+        [request.params.requestId, request.auth.organization_id],
+      );
+      const row = current.rows[0];
+      const reject = async (status, code, message) => {
+        await client.query('ROLLBACK');
+        return fail(response, status, code, message);
+      };
+      if (!row) return reject(404, 'REQUEST_NOT_FOUND', 'Request was not found.');
+      if (row.status !== 'open') return reject(409, 'REQUEST_NOT_OPEN', 'Trip details can only be changed while the request is open for offers.');
+      if (new Date(row.response_deadline) <= new Date()) return reject(409, 'RESPONSE_DEADLINE_PASSED', 'The response deadline has passed, so sellers can no longer re-confirm.');
+      if (meta.data.trip_version !== Number(row.trip_version)) return reject(409, 'TRIP_CHANGED', 'These trip details were changed by someone else. Reload the request and try again.');
+      const previousTrip = tripFields({ ...row, travel_start_date: row.start_text, travel_end_date: row.end_text });
+      if (isDeepStrictEqual(previousTrip, nextTrip)) return reject(400, 'NO_TRIP_CHANGES', 'Change the dates, travellers or rooms before saving.');
+      const currentDeadline = new Date(row.response_deadline);
+      if (requestedDeadline && requestedDeadline.deadline < currentDeadline) return reject(400, 'VALIDATION_ERROR', 'After publishing, the response deadline can be extended but not shortened.');
+      const deadline = requestedDeadline?.deadline ?? currentDeadline;
+      if (deadline < new Date(Date.now() + config.requestDeadline.minHours * hourMs)) {
+        return reject(409, 'DEADLINE_TOO_CLOSE', `Sellers need at least ${config.requestDeadline.minHours} hour(s) to re-confirm. Extend the response deadline with this change.`);
+      }
+
+      const updated = await client.query(
+        `UPDATE marketplace_requests SET travel_start_date = $2, travel_end_date = $3, travel_month = $4, nights = $5,
+           adults = $6, children = $7, infants = $8, room_count = $9, response_deadline = $10,
+           trip_version = trip_version + 1, trip_changed_at = NOW(), updated_at = NOW()
+         WHERE id = $1 RETURNING *`,
+        [row.id, nextTrip.travel_start_date, nextTrip.travel_end_date, nextTrip.travel_month, nextTrip.nights,
+          nextTrip.adults, nextTrip.children, nextTrip.infants, nextTrip.room_count, deadline],
+      );
+      const changed = updated.rows[0];
+      const change = await client.query(
+        `INSERT INTO request_trip_changes (id, request_id, trip_version, changed_by_user_id, previous_trip, current_trip, note)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+        [randomUUID(), row.id, changed.trip_version, request.auth.user_id, JSON.stringify(previousTrip), JSON.stringify(nextTrip), meta.data.note],
+      );
+      await client.query(refreshSellerSnapshotSql, [row.id]);
+      const sellers = await client.query(
+        `SELECT t.seller_organization_id, (f.id IS NOT NULL) AS has_offer FROM request_targets t
+         LEFT JOIN offers f ON f.request_id = t.request_id AND f.seller_organization_id = t.seller_organization_id
+           AND f.status IN ('submitted', 'shortlisted')
+         WHERE t.request_id = $1 AND t.declined_at IS NULL`,
+        [row.id],
+      );
+      const summary = tripDto(nextTrip);
+      for (const seller of sellers.rows) {
+        await notify(client, seller.seller_organization_id, 'request_trip_changed',
+          seller.has_offer ? 'Trip changed: re-confirm your offer' : 'Trip details changed',
+          `${row.request_code} / ${row.destination} / ${summary.dates} / ${summary.travelers}`,
+          { requestId: row.id, requestCode: row.request_code, tripVersion: changed.trip_version });
+      }
+      await client.query('COMMIT');
+      return response.json({
+        request: { ...requestDto({ ...changed, agency_name: request.auth.organization_name, agency_verified: request.auth.verified_at }), tripChange: tripChangeDto(change.rows[0]) },
+        offersAwaitingReconfirmation: sellers.rows.filter((seller) => seller.has_offer).length,
+      });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      return next(error);
+    } finally {
+      client.release();
     }
   });
 
@@ -673,6 +885,8 @@ export function createMarketplaceRouter({ pool }) {
     const input = parseWith(offerSchemaFor(offerKind), request.body);
     if (input.error) return fail(response, 400, 'VALIDATION_ERROR', input.error);
     const offerInput = input.data;
+    const acknowledgedTripVersion = parseTripVersion(request.body?.trip_version);
+    if (acknowledgedTripVersion === undefined) return fail(response, 400, 'VALIDATION_ERROR', 'Trip version must be a positive whole number.');
 
     const client = await pool.connect();
     try {
@@ -684,7 +898,7 @@ export function createMarketplaceRouter({ pool }) {
       }
       const target = await client.query(
         `SELECT r.id, r.agency_organization_id, r.request_code, r.destination, r.services, r.response_deadline,
-                r.adults, r.children, r.nights, r.room_count
+                r.adults, r.children, r.nights, r.room_count, r.trip_version
          FROM request_targets t JOIN marketplace_requests r ON r.id = t.request_id
          WHERE t.request_id = $1 AND t.seller_organization_id = $2 AND t.declined_at IS NULL AND r.status = 'open'
          FOR UPDATE OF r`,
@@ -693,6 +907,10 @@ export function createMarketplaceRouter({ pool }) {
       if (!target.rowCount) {
         await client.query('ROLLBACK');
         return fail(response, 404, 'REQUEST_NOT_AVAILABLE', 'This request is not available to your organization.');
+      }
+      if (acknowledgedTripVersion != null && acknowledgedTripVersion !== Number(target.rows[0].trip_version)) {
+        await client.query('ROLLBACK');
+        return fail(response, 409, 'TRIP_CHANGED', 'The agency changed the trip details. Review the latest details before sending your offer.');
       }
       if (new Date(target.rows[0].response_deadline) <= new Date()) {
         await client.query('ROLLBACK');
@@ -716,22 +934,24 @@ export function createMarketplaceRouter({ pool }) {
         `INSERT INTO offers (id, request_id, seller_organization_id, offer_kind, total_minor, rate_per_night_minor,
            room_type, currency, inclusions, exclusions, meal_plan, validity_until, cancellation_policy,
            free_cancellation_until, deposit_percent, balance_due_days_before_travel, payment_notes,
-           room_count, taxes_included, availability_confirmed)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+           room_count, taxes_included, availability_confirmed, confirmed_trip_version, hotel_category, option_label)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
          RETURNING *`,
         [randomUUID(), request.params.requestId, request.auth.organization_id, offerKind,
           offerInput.total_minor ?? null, offerInput.rate_per_night_minor ?? null, offerInput.room_type ?? null,
           offerInput.currency, offerInput.inclusions, offerInput.exclusions, offerInput.meal_plan ?? null, offerInput.validity_until,
           offerInput.cancellation_policy, offerInput.free_cancellation_until, offerInput.deposit_percent,
           offerInput.balance_due_days_before_travel, offerInput.payment_notes, offerInput.room_count ?? null,
-          offerInput.taxes_included ?? null, offerInput.availability_confirmed ?? null],
+          offerInput.taxes_included ?? null, offerInput.availability_confirmed ?? null, target.rows[0].trip_version,
+          offerInput.hotel_category ?? null, offerInput.option_label],
       );
       const offer = result.rows[0];
       await replaceLineItems(client, offer.id, offerInput.line_items ?? [], randomUUID);
-      const lineItems = await loadLineItems(client, [offer.id]);
+      await replaceOptions(client, offer.id, offerInput.options, randomUUID);
+      const parts = await loadOfferParts(client, [offer.id]);
       await notify(client, target.rows[0].agency_organization_id, 'offer_submitted', 'New seller offer', `${target.rows[0].request_code} / ${request.auth.organization_name} / ${target.rows[0].destination}`, { requestId: request.params.requestId, requestCode: target.rows[0].request_code, offerId: offer.id });
       await client.query('COMMIT');
-      return response.status(201).json({ offer: offerDto(offer, { lineItems: lineItems.get(offer.id), request: target.rows[0] }) });
+      return response.status(201).json({ offer: offerDto(offer, { ...parts(offer.id), request: target.rows[0] }) });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       if (error.code === '23505') return fail(response, 409, 'OFFER_ALREADY_SUBMITTED', 'Your organization already has an active offer for this request.');
@@ -744,7 +964,7 @@ export function createMarketplaceRouter({ pool }) {
   router.get('/requests/:requestId/offers', async (request, response, next) => {
     if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the requesting agency can compare offers.');
     try {
-      const ownedRequest = await pool.query('SELECT id, adults, children, nights, room_count FROM marketplace_requests WHERE id = $1 AND agency_organization_id = $2', [request.params.requestId, request.auth.organization_id]);
+      const ownedRequest = await pool.query('SELECT id, adults, children, nights, room_count, trip_version FROM marketplace_requests WHERE id = $1 AND agency_organization_id = $2', [request.params.requestId, request.auth.organization_id]);
       if (!ownedRequest.rowCount) return fail(response, 404, 'REQUEST_NOT_FOUND', 'Request was not found.');
       const result = await pool.query(
         `SELECT f.*, seller.name AS seller_name
@@ -755,8 +975,8 @@ export function createMarketplaceRouter({ pool }) {
          ORDER BY f.created_at ASC`,
         [request.params.requestId],
       );
-      const lineItems = await loadLineItems(pool, result.rows.map((row) => row.id));
-      return response.json({ offers: result.rows.map((offer) => offerDto(offer, { lineItems: lineItems.get(offer.id), request: ownedRequest.rows[0], sellerName: offer.seller_name })) });
+      const parts = await loadOfferParts(pool, result.rows.map((row) => row.id));
+      return response.json({ offers: result.rows.map((offer) => offerDto(offer, { ...parts(offer.id), request: ownedRequest.rows[0], sellerName: offer.seller_name })) });
     } catch (error) {
       return next(error);
     }
@@ -766,7 +986,7 @@ export function createMarketplaceRouter({ pool }) {
     try {
       const result = await pool.query(
         `SELECT f.*, r.agency_organization_id, r.request_code, r.destination, r.adults, r.children, r.nights,
-                r.room_count AS request_room_count, seller.name AS seller_name
+                r.room_count AS request_room_count, r.trip_version, seller.name AS seller_name
          FROM offers f JOIN marketplace_requests r ON r.id = f.request_id
          JOIN organizations seller ON seller.id = f.seller_organization_id
          WHERE f.id = $1`,
@@ -777,9 +997,9 @@ export function createMarketplaceRouter({ pool }) {
       const isOwnSellerOffer = offer.seller_organization_id === request.auth.organization_id;
       const isRequestingAgency = offer.agency_organization_id === request.auth.organization_id && request.auth.business_type === 'agency';
       if (!isOwnSellerOffer && !isRequestingAgency) return fail(response, 404, 'OFFER_NOT_FOUND', 'Offer was not found.');
-      const lineItems = await loadLineItems(pool, [offer.id]);
-      const requestFacts = { adults: offer.adults, children: offer.children, nights: offer.nights, room_count: offer.request_room_count };
-      return response.json({ offer: { ...offerDto(offer, { lineItems: lineItems.get(offer.id), request: requestFacts, sellerName: isRequestingAgency ? offer.seller_name : undefined }), requestCode: offer.request_code, destination: offer.destination } });
+      const parts = await loadOfferParts(pool, [offer.id]);
+      const requestFacts = { adults: offer.adults, children: offer.children, nights: offer.nights, room_count: offer.request_room_count, trip_version: offer.trip_version };
+      return response.json({ offer: { ...offerDto(offer, { ...parts(offer.id), request: requestFacts, sellerName: isRequestingAgency ? offer.seller_name : undefined }), requestCode: offer.request_code, destination: offer.destination } });
     } catch (error) {
       return next(error);
     }
@@ -806,23 +1026,28 @@ export function createMarketplaceRouter({ pool }) {
     const input = parseWith(offerSchemaFor(offerKind), request.body);
     if (input.error) return fail(response, 400, 'VALIDATION_ERROR', input.error);
     const offerInput = input.data;
+    const acknowledgedTripVersion = parseTripVersion(request.body?.trip_version);
+    if (acknowledgedTripVersion === undefined) return fail(response, 400, 'VALIDATION_ERROR', 'Trip version must be a positive whole number.');
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
       const current = await client.query(
         `SELECT f.*, r.agency_organization_id, r.response_deadline, r.adults, r.children, r.nights,
-                r.room_count AS request_room_count
+                r.room_count AS request_room_count, r.trip_version, r.status AS request_status,
+                (SELECT n.id FROM offer_negotiations n WHERE n.offer_id = f.id AND n.status = 'open') AS open_negotiation_id
          FROM offers f JOIN marketplace_requests r ON r.id = f.request_id
-         WHERE f.id = $1 AND f.seller_organization_id = $2 AND r.status = 'open'
+         WHERE f.id = $1 AND f.seller_organization_id = $2 AND r.status IN ('open', 'closed')
            AND f.status IN ('submitted', 'shortlisted') FOR UPDATE OF f`,
         [request.params.offerId, request.auth.organization_id],
       );
-      if (!current.rowCount) {
+      const answersNegotiation = Boolean(current.rows[0]?.open_negotiation_id);
+      // An agency's open revision request or counter-offer lets the seller answer after the deadline.
+      if (!current.rowCount || (current.rows[0].request_status !== 'open' && !answersNegotiation)) {
         await client.query('ROLLBACK');
         return fail(response, 404, 'OFFER_NOT_EDITABLE', 'This active offer was not found.');
       }
       const oldOffer = current.rows[0];
-      if (new Date(oldOffer.response_deadline) <= new Date()) {
+      if (!answersNegotiation && new Date(oldOffer.response_deadline) <= new Date()) {
         await client.query('ROLLBACK');
         return fail(response, 409, 'RESPONSE_DEADLINE_PASSED', 'Offers cannot be revised after the response deadline.');
       }
@@ -830,30 +1055,42 @@ export function createMarketplaceRouter({ pool }) {
         await client.query('ROLLBACK');
         return fail(response, 403, 'ROLE_FORBIDDEN', 'This offer type does not belong to your seller role.');
       }
-      const oldLineItems = await loadLineItems(client, [oldOffer.id]);
-      const latestRevision = await client.query('SELECT COALESCE(MAX(revision_number), 0) AS revision_number FROM offer_revisions WHERE offer_id = $1', [oldOffer.id]);
-      const requestFacts = { adults: oldOffer.adults, children: oldOffer.children, nights: oldOffer.nights, room_count: oldOffer.request_room_count };
-      const snapshot = offerDto(oldOffer, { lineItems: oldLineItems.get(oldOffer.id), request: requestFacts });
-      await client.query('INSERT INTO offer_revisions (id, offer_id, revision_number, snapshot) VALUES ($1, $2, $3, $4)', [randomUUID(), oldOffer.id, Number(latestRevision.rows[0].revision_number) + 1, JSON.stringify(snapshot)]);
+      if (acknowledgedTripVersion != null && acknowledgedTripVersion !== Number(oldOffer.trip_version)) {
+        await client.query('ROLLBACK');
+        return fail(response, 409, 'TRIP_CHANGED', 'The agency changed the trip details again. Review the latest details before revising.');
+      }
+      // A revision only re-confirms the offer when the seller says which trip version it priced.
+      const confirmedTripVersion = acknowledgedTripVersion ?? oldOffer.confirmed_trip_version;
+      const reconfirmed = confirmedTripVersion > oldOffer.confirmed_trip_version;
+      const requestFacts = requestFactsOf(oldOffer);
+      await recordOfferRevision(client, oldOffer, requestFacts);
       const revised = await client.query(
         `UPDATE offers SET total_minor = $2, rate_per_night_minor = $3, room_type = $4,
            currency = $5, inclusions = $6, exclusions = $7, meal_plan = $8,
            cancellation_policy = $9, validity_until = $10, free_cancellation_until = $11,
            deposit_percent = $12, balance_due_days_before_travel = $13, payment_notes = $14,
            room_count = $15, taxes_included = $16, availability_confirmed = $17,
+           confirmed_trip_version = $18, reconfirmed_at = CASE WHEN $19 THEN NOW() ELSE reconfirmed_at END,
+           hotel_category = $20, option_label = $21,
            status = 'submitted', updated_at = NOW()
          WHERE id = $1 RETURNING *`,
         [oldOffer.id, offerInput.total_minor ?? null, offerInput.rate_per_night_minor ?? null, offerInput.room_type ?? null,
           offerInput.currency, offerInput.inclusions, offerInput.exclusions, offerInput.meal_plan ?? null,
           offerInput.cancellation_policy, offerInput.validity_until, offerInput.free_cancellation_until,
           offerInput.deposit_percent, offerInput.balance_due_days_before_travel, offerInput.payment_notes,
-          offerInput.room_count ?? null, offerInput.taxes_included ?? null, offerInput.availability_confirmed ?? null],
+          offerInput.room_count ?? null, offerInput.taxes_included ?? null, offerInput.availability_confirmed ?? null,
+          confirmedTripVersion, reconfirmed, offerInput.hotel_category ?? null, offerInput.option_label],
       );
       await replaceLineItems(client, oldOffer.id, offerInput.line_items ?? [], randomUUID);
-      const lineItems = await loadLineItems(client, [oldOffer.id]);
-      await notify(client, oldOffer.agency_organization_id, 'offer_revised', 'Seller revised an offer', `${oldOffer.request_id} / ${request.auth.organization_name}`, { offerId: oldOffer.id, requestId: oldOffer.request_id });
+      await replaceOptions(client, oldOffer.id, offerInput.options, randomUUID);
+      if (answersNegotiation) {
+        await client.query("UPDATE offer_negotiations SET status = 'revised', responded_by_user_id = $2, responded_at = NOW() WHERE id = $1", [oldOffer.open_negotiation_id, request.auth.user_id]);
+      }
+      const parts = await loadOfferParts(client, [oldOffer.id]);
+      const revisedTitle = answersNegotiation ? 'Seller revised an offer as you asked' : reconfirmed ? 'Seller revised an offer for the changed trip' : 'Seller revised an offer';
+      await notify(client, oldOffer.agency_organization_id, 'offer_revised', revisedTitle, `${oldOffer.request_id} / ${request.auth.organization_name}`, { offerId: oldOffer.id, requestId: oldOffer.request_id });
       await client.query('COMMIT');
-      return response.json({ offer: offerDto(revised.rows[0], { lineItems: lineItems.get(oldOffer.id), request: requestFacts }) });
+      return response.json({ offer: offerDto(revised.rows[0], { ...parts(oldOffer.id), request: requestFacts }) });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       return next(error);
@@ -862,14 +1099,211 @@ export function createMarketplaceRouter({ pool }) {
     }
   });
 
+  router.post('/offers/:offerId/reconfirm', requireCapability(capabilities.offerWrite), async (request, response, next) => {
+    if (!['dmc', 'hotelier'].includes(request.auth.business_type)) return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the seller can re-confirm its offer.');
+    if (!uuidPattern.test(request.params.offerId)) return fail(response, 404, 'OFFER_NOT_EDITABLE', 'This active offer was not found.');
+    const acknowledgedTripVersion = parseTripVersion(request.body?.trip_version);
+    if (acknowledgedTripVersion == null) return fail(response, 400, 'VALIDATION_ERROR', 'Send the trip version you are re-confirming.');
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const current = await client.query(
+        `SELECT f.*, r.agency_organization_id, r.request_code, r.destination, r.response_deadline, r.adults, r.children, r.nights,
+                r.room_count AS request_room_count, r.trip_version
+         FROM offers f JOIN marketplace_requests r ON r.id = f.request_id
+         WHERE f.id = $1 AND f.seller_organization_id = $2 AND r.status = 'open'
+           AND f.status IN ('submitted', 'shortlisted') FOR UPDATE OF f`,
+        [request.params.offerId, request.auth.organization_id],
+      );
+      const offer = current.rows[0];
+      const reject = async (status, code, message) => {
+        await client.query('ROLLBACK');
+        return fail(response, status, code, message);
+      };
+      if (!offer) return reject(404, 'OFFER_NOT_EDITABLE', 'This active offer was not found.');
+      if (new Date(offer.response_deadline) <= new Date()) return reject(409, 'RESPONSE_DEADLINE_PASSED', 'Offers cannot be re-confirmed after the response deadline.');
+      if (offer.confirmed_trip_version >= offer.trip_version) return reject(409, 'OFFER_ALREADY_CONFIRMED', 'This offer already matches the current trip details.');
+      if (acknowledgedTripVersion !== Number(offer.trip_version)) return reject(409, 'TRIP_CHANGED', 'The agency changed the trip details again. Review the latest details before re-confirming.');
+      if (new Date(offer.validity_until) <= new Date()) return reject(409, 'OFFER_EXPIRED', 'This offer is no longer valid. Revise it with a new validity date instead.');
+
+      const requestFacts = requestFactsOf(offer);
+      await recordOfferRevision(client, offer, requestFacts);
+      const updated = await client.query(
+        'UPDATE offers SET confirmed_trip_version = $2, reconfirmed_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING *',
+        [offer.id, offer.trip_version],
+      );
+      const parts = await loadOfferParts(client, [offer.id]);
+      await notify(client, offer.agency_organization_id, 'offer_reconfirmed', 'Seller re-confirmed an offer', `${offer.request_code} / ${request.auth.organization_name} / Same price for the changed trip`, { offerId: offer.id, requestId: offer.request_id, requestCode: offer.request_code });
+      await client.query('COMMIT');
+      return response.json({ offer: offerDto(updated.rows[0], { ...parts(offer.id), request: requestFacts }) });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      return next(error);
+    } finally {
+      client.release();
+    }
+  });
+
+  router.get('/offers/:offerId/negotiations', async (request, response, next) => {
+    if (!uuidPattern.test(request.params.offerId)) return fail(response, 404, 'OFFER_NOT_FOUND', 'Offer was not found.');
+    try {
+      const owner = await pool.query(
+        `SELECT f.seller_organization_id, r.agency_organization_id FROM offers f
+         JOIN marketplace_requests r ON r.id = f.request_id WHERE f.id = $1`,
+        [request.params.offerId],
+      );
+      const parties = owner.rows[0];
+      if (!parties || ![parties.seller_organization_id, parties.agency_organization_id].includes(request.auth.organization_id)) return fail(response, 404, 'OFFER_NOT_FOUND', 'Offer was not found.');
+      return response.json({ negotiations: await listNegotiations(pool, request.params.offerId) });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.post('/offers/:offerId/negotiations', requireCapability(capabilities.requestWrite), async (request, response, next) => {
+    if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the requesting agency can ask for a revision or send a counter-offer.');
+    if (!uuidPattern.test(request.params.offerId)) return fail(response, 404, 'OFFER_NOT_FOUND', 'Offer was not found.');
+    const input = parseWith(negotiationSchema, request.body);
+    if (input.error) return fail(response, 400, 'VALIDATION_ERROR', input.error);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const reject = async (status, code, message) => {
+        await client.query('ROLLBACK');
+        return fail(response, status, code, message);
+      };
+      const current = await client.query(
+        `SELECT f.id, f.status, f.seller_organization_id, f.request_id, r.status AS request_status, r.request_code, r.destination,
+                (SELECT COUNT(*)::int FROM offer_negotiations n WHERE n.offer_id = f.id) AS rounds,
+                EXISTS (SELECT 1 FROM offer_negotiations n WHERE n.offer_id = f.id AND n.status = 'open') AS has_open
+         FROM offers f JOIN marketplace_requests r ON r.id = f.request_id
+         WHERE f.id = $1 AND r.agency_organization_id = $2 FOR UPDATE OF f`,
+        [request.params.offerId, request.auth.organization_id],
+      );
+      const offer = current.rows[0];
+      if (!offer) return reject(404, 'OFFER_NOT_FOUND', 'Offer was not found.');
+      if (!['submitted', 'shortlisted'].includes(offer.status) || !['open', 'closed'].includes(offer.request_status)) return reject(409, 'OFFER_NOT_NEGOTIABLE', 'Only active offers on an undecided request can be negotiated.');
+      if (offer.has_open) return reject(409, 'NEGOTIATION_ALREADY_OPEN', 'Wait for the seller to answer your last request, or withdraw it first.');
+      if (offer.rounds >= config.maxNegotiationRoundsPerOffer) return reject(409, 'NEGOTIATION_LIMIT_REACHED', `An offer can be negotiated at most ${config.maxNegotiationRoundsPerOffer} times.`);
+      const { kind, message, counter_price_minor: counterPriceMinor, offer_option_id: optionId } = input.data;
+      const option = optionId ? await client.query('SELECT label FROM offer_options WHERE id = $1 AND offer_id = $2', [optionId, offer.id]) : null;
+      if (option && !option.rowCount) return reject(404, 'OPTION_NOT_AVAILABLE', 'This option is no longer part of the offer. Reload the offers and choose again.');
+      const created = await client.query(
+        `INSERT INTO offer_negotiations (id, offer_id, offer_option_id, option_label, kind, message, counter_price_minor, requested_by_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+        [randomUUID(), offer.id, optionId, option?.rows[0].label ?? null, kind, message, counterPriceMinor, request.auth.user_id],
+      );
+      const counter = kind === 'counter_offer';
+      await notify(client, offer.seller_organization_id, counter ? 'offer_counter_received' : 'offer_revision_requested', counter ? 'Agency sent a counter-offer' : 'Agency asked for a revised offer', `${offer.request_code} / ${offer.destination}${message ? ` / ${message}` : ''}`, { requestId: offer.request_id, requestCode: offer.request_code, offerId: offer.id, negotiationId: created.rows[0].id });
+      await client.query('COMMIT');
+      const [negotiation] = (await listNegotiations(client, offer.id)).filter((item) => item.id === created.rows[0].id);
+      return response.status(201).json({ negotiation });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      if (error.code === '23505') return fail(response, 409, 'NEGOTIATION_ALREADY_OPEN', 'Wait for the seller to answer your last request, or withdraw it first.');
+      return next(error);
+    } finally {
+      client.release();
+    }
+  });
+
+  router.post('/negotiations/:negotiationId/withdraw', requireCapability(capabilities.requestWrite), async (request, response, next) => {
+    if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the requesting agency can withdraw its request.');
+    if (!uuidPattern.test(request.params.negotiationId)) return fail(response, 404, 'NEGOTIATION_NOT_OPEN', 'This open negotiation was not found.');
+    try {
+      const result = await pool.query(
+        `UPDATE offer_negotiations n SET status = 'withdrawn', responded_at = NOW()
+         FROM offers f JOIN marketplace_requests r ON r.id = f.request_id
+         WHERE n.id = $1 AND n.offer_id = f.id AND r.agency_organization_id = $2 AND n.status = 'open'
+         RETURNING n.*, f.currency, f.offer_kind`,
+        [request.params.negotiationId, request.auth.organization_id],
+      );
+      if (!result.rowCount) return fail(response, 404, 'NEGOTIATION_NOT_OPEN', 'This open negotiation was not found.');
+      return response.json({ negotiation: negotiationDto(result.rows[0]) });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  // Seller answers: accept a counter price as-is, or decline with a reason. Revising the offer answers either kind.
+  const answerNegotiation = (accepting) => async (request, response, next) => {
+    if (!['dmc', 'hotelier'].includes(request.auth.business_type)) return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the seller can answer a negotiation.');
+    if (!uuidPattern.test(request.params.negotiationId)) return fail(response, 404, 'NEGOTIATION_NOT_FOUND', 'Negotiation was not found.');
+    const decline = accepting ? null : parseWith(declineSchema, request.body);
+    if (decline?.error) return fail(response, 400, 'VALIDATION_ERROR', decline.error);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const reject = async (status, code, message) => {
+        await client.query('ROLLBACK');
+        return fail(response, status, code, message);
+      };
+      const current = await client.query(
+        `SELECT n.id AS negotiation_id, n.kind, n.status AS negotiation_status, n.offer_option_id, n.counter_price_minor,
+                f.*, r.status AS request_status, r.agency_organization_id, r.request_code, r.destination,
+                r.adults, r.children, r.nights, r.room_count AS request_room_count, r.trip_version
+         FROM offer_negotiations n JOIN offers f ON f.id = n.offer_id JOIN marketplace_requests r ON r.id = f.request_id
+         WHERE n.id = $1 AND f.seller_organization_id = $2 FOR UPDATE OF n, f`,
+        [request.params.negotiationId, request.auth.organization_id],
+      );
+      const row = current.rows[0];
+      if (!row) return reject(404, 'NEGOTIATION_NOT_FOUND', 'Negotiation was not found.');
+      if (row.negotiation_status !== 'open') return reject(409, 'NEGOTIATION_NOT_OPEN', 'This negotiation was already answered or withdrawn.');
+      if (!['submitted', 'shortlisted'].includes(row.status) || !['open', 'closed'].includes(row.request_status)) return reject(409, 'OFFER_NOT_NEGOTIABLE', 'This offer can no longer change.');
+      const summary = `${row.request_code} / ${request.auth.organization_name}`;
+      const eventData = { requestId: row.request_id, requestCode: row.request_code, offerId: row.id, negotiationId: row.negotiation_id };
+
+      if (!accepting) {
+        await client.query("UPDATE offer_negotiations SET status = 'declined', response_note = $2, responded_by_user_id = $3, responded_at = NOW() WHERE id = $1", [row.negotiation_id, decline.data.note, request.auth.user_id]);
+        await notify(client, row.agency_organization_id, 'offer_negotiation_declined', row.kind === 'counter_offer' ? 'Seller declined your counter-offer' : 'Seller declined your revision request', `${summary} / Reason: ${decline.data.note}`, eventData);
+        await client.query('COMMIT');
+        return response.json({ negotiation: (await listNegotiations(client, row.id)).find((item) => item.id === row.negotiation_id) });
+      }
+
+      if (row.kind !== 'counter_offer') return reject(409, 'NEGOTIATION_NOT_COUNTER', 'Answer a revision request by revising your offer.');
+      if (new Date(row.validity_until) <= new Date()) return reject(409, 'OFFER_EXPIRED', 'This offer is no longer valid. Revise it with a new validity date instead.');
+      const priceColumn = row.offer_kind === 'hotel_room' ? 'rate_per_night_minor' : 'total_minor';
+      if (!row.offer_option_id && row.offer_kind === 'land_package') {
+        const lines = await client.query('SELECT 1 FROM offer_line_items WHERE offer_id = $1 LIMIT 1', [row.id]);
+        if (lines.rowCount) return reject(409, 'COUNTER_NEEDS_REVISION', 'Your offer has a price breakdown. Revise the offer so the line items add up to the counter price.');
+      }
+      await recordOfferRevision(client, row, requestFactsOf(row));
+      if (row.offer_option_id) {
+        await client.query(`UPDATE offer_options SET ${priceColumn} = $2 WHERE id = $1`, [row.offer_option_id, row.counter_price_minor]);
+        await client.query('UPDATE offers SET updated_at = NOW() WHERE id = $1', [row.id]);
+      } else {
+        await client.query(`UPDATE offers SET ${priceColumn} = $2, updated_at = NOW() WHERE id = $1`, [row.id, row.counter_price_minor]);
+      }
+      await client.query("UPDATE offer_negotiations SET status = 'accepted', responded_by_user_id = $2, responded_at = NOW() WHERE id = $1", [row.negotiation_id, request.auth.user_id]);
+      await notify(client, row.agency_organization_id, 'offer_counter_accepted', 'Seller accepted your counter-offer', summary, eventData);
+      const updated = await client.query('SELECT * FROM offers WHERE id = $1', [row.id]);
+      const parts = await loadOfferParts(client, [row.id]);
+      await client.query('COMMIT');
+      return response.json({ offer: offerDto(updated.rows[0], { ...parts(row.id), request: requestFactsOf(row) }) });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      return next(error);
+    } finally {
+      client.release();
+    }
+  };
+  router.post('/negotiations/:negotiationId/accept', requireCapability(capabilities.offerWrite), answerNegotiation(true));
+  router.post('/negotiations/:negotiationId/decline', requireCapability(capabilities.offerWrite), answerNegotiation(false));
+
   router.post('/offers/:offerId/withdraw', requireCapability(capabilities.offerWrite), async (request, response, next) => {
     if (!['dmc', 'hotelier'].includes(request.auth.business_type)) return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the seller can withdraw its offer.');
     try {
       const result = await pool.query(
-        `UPDATE offers f SET status = 'withdrawn', updated_at = NOW()
-         FROM marketplace_requests r WHERE f.id = $1 AND f.request_id = r.id
-           AND f.seller_organization_id = $2 AND r.status = 'open' AND f.status IN ('submitted', 'shortlisted')
-         RETURNING f.id, f.request_id, r.agency_organization_id, r.request_code, r.destination`,
+        `WITH withdrawn AS (
+           UPDATE offers f SET status = 'withdrawn', updated_at = NOW()
+           FROM marketplace_requests r WHERE f.id = $1 AND f.request_id = r.id
+             AND f.seller_organization_id = $2 AND r.status = 'open' AND f.status IN ('submitted', 'shortlisted')
+           RETURNING f.id, f.request_id, r.agency_organization_id, r.request_code, r.destination
+         ), closed AS (
+           UPDATE offer_negotiations SET status = 'closed', responded_at = NOW()
+           WHERE status = 'open' AND offer_id IN (SELECT id FROM withdrawn)
+         )
+         SELECT * FROM withdrawn`,
         [request.params.offerId, request.auth.organization_id],
       );
       if (!result.rowCount) return fail(response, 404, 'OFFER_NOT_WITHDRAWABLE', 'Active offer was not found.');
@@ -887,6 +1321,7 @@ export function createMarketplaceRouter({ pool }) {
             `SELECT f.id, f.request_id, r.request_code, r.destination, f.offer_kind, f.total_minor,
               f.rate_per_night_minor, f.room_type, f.meal_plan, f.currency, f.inclusions,
               f.exclusions, f.validity_until, f.status, f.created_at,
+              (f.confirmed_trip_version < r.trip_version) AS needs_reconfirmation,
                   seller.name AS seller_name
            FROM marketplace_requests r
            JOIN offers f ON f.request_id = r.id
@@ -897,22 +1332,25 @@ export function createMarketplaceRouter({ pool }) {
            ORDER BY f.created_at DESC`,
           [request.auth.organization_id],
         );
-        return response.json({ offers: agencyOffers.rows.map((offer) => ({ id: offer.id, requestId: offer.request_id, requestCode: offer.request_code, destination: offer.destination, sellerName: offer.seller_name, kind: offer.offer_kind, totalMinor: offer.total_minor, ratePerNightMinor: offer.rate_per_night_minor, roomType: offer.room_type, mealPlan: offer.meal_plan, currency: offer.currency, inclusions: offer.inclusions, exclusions: offer.exclusions, validityUntil: offer.validity_until, status: offer.status, createdAt: offer.created_at })) });
+        return response.json({ offers: agencyOffers.rows.map((offer) => ({ id: offer.id, requestId: offer.request_id, requestCode: offer.request_code, destination: offer.destination, sellerName: offer.seller_name, kind: offer.offer_kind, totalMinor: offer.total_minor, ratePerNightMinor: offer.rate_per_night_minor, roomType: offer.room_type, mealPlan: offer.meal_plan, currency: offer.currency, inclusions: offer.inclusions, exclusions: offer.exclusions, validityUntil: offer.validity_until, status: offer.status, createdAt: offer.created_at, needsReconfirmation: offer.needs_reconfirmation })) });
       }
       if (request.auth.business_type === 'hotelier') {
         const hotelOffers = await pool.query(
           `SELECT f.id, f.request_id, r.request_code, r.destination, f.rate_per_night_minor,
-                  f.room_type, f.meal_plan, f.currency, f.validity_until, f.status, f.outcome_reason, f.created_at
+                  f.room_type, f.meal_plan, f.currency, f.validity_until, f.status, f.outcome_reason, f.created_at,
+                  (f.status IN ('submitted', 'shortlisted') AND f.confirmed_trip_version < r.trip_version) AS needs_reconfirmation
            FROM offers f JOIN marketplace_requests r ON r.id = f.request_id
            WHERE f.seller_organization_id = $1 ORDER BY f.created_at DESC`,
           [request.auth.organization_id],
         );
-        return response.json({ offers: hotelOffers.rows.map((offer) => ({ id: offer.id, requestId: offer.request_id, requestCode: offer.request_code, destination: offer.destination, kind: 'hotel_room', ratePerNightMinor: offer.rate_per_night_minor, roomType: offer.room_type, mealPlan: offer.meal_plan, currency: offer.currency, validityUntil: offer.validity_until, status: offer.status, outcomeReason: offer.outcome_reason, createdAt: offer.created_at })) });
+        const hotelNegotiations = await loadOpenNegotiations(pool, hotelOffers.rows.map((offer) => offer.id));
+        return response.json({ offers: hotelOffers.rows.map((offer) => ({ id: offer.id, requestId: offer.request_id, requestCode: offer.request_code, destination: offer.destination, kind: 'hotel_room', ratePerNightMinor: offer.rate_per_night_minor, roomType: offer.room_type, mealPlan: offer.meal_plan, currency: offer.currency, validityUntil: offer.validity_until, status: offer.status, outcomeReason: offer.outcome_reason, createdAt: offer.created_at, needsReconfirmation: offer.needs_reconfirmation, openNegotiation: hotelNegotiations.get(offer.id) ?? null })) });
       }
       if (request.auth.business_type !== 'dmc') return fail(response, 403, 'ROLE_FORBIDDEN', 'This offer inbox is for sellers.');
       const result = await pool.query(
         `SELECT f.id, f.request_id, r.request_code, r.destination, f.total_minor, f.currency,
                 f.inclusions, f.exclusions, f.validity_until, f.status, f.outcome_reason, f.created_at,
+                (f.status IN ('submitted', 'shortlisted') AND f.confirmed_trip_version < r.trip_version) AS needs_reconfirmation,
                  1 + (SELECT COUNT(*) FROM offers lower_offer WHERE lower_offer.request_id = f.request_id
                    AND lower_offer.offer_kind = 'land_package'
                      AND lower_offer.currency = f.currency AND lower_offer.total_minor < f.total_minor
@@ -924,7 +1362,8 @@ export function createMarketplaceRouter({ pool }) {
          WHERE f.seller_organization_id = $1 AND f.offer_kind = 'land_package' ORDER BY f.created_at DESC`,
         [request.auth.organization_id],
       );
-      return response.json({ offers: result.rows.map((offer) => ({ id: offer.id, requestId: offer.request_id, requestCode: offer.request_code, destination: offer.destination, totalMinor: offer.total_minor, currency: offer.currency, inclusions: offer.inclusions, exclusions: offer.exclusions, validityUntil: offer.validity_until, status: offer.status, outcomeReason: offer.outcome_reason, createdAt: offer.created_at, rank: Number(offer.seller_rank), eligibleCount: Number(offer.eligible_count) })) });
+      const negotiations = await loadOpenNegotiations(pool, result.rows.map((offer) => offer.id));
+      return response.json({ offers: result.rows.map((offer) => ({ id: offer.id, requestId: offer.request_id, requestCode: offer.request_code, destination: offer.destination, totalMinor: offer.total_minor, currency: offer.currency, inclusions: offer.inclusions, exclusions: offer.exclusions, validityUntil: offer.validity_until, status: offer.status, outcomeReason: offer.outcome_reason, createdAt: offer.created_at, rank: Number(offer.seller_rank), eligibleCount: Number(offer.eligible_count), needsReconfirmation: offer.needs_reconfirmation, openNegotiation: negotiations.get(offer.id) ?? null })) });
     } catch (error) {
       return next(error);
     }
@@ -932,48 +1371,117 @@ export function createMarketplaceRouter({ pool }) {
 
   router.post('/requests/:requestId/award', requireCapability(capabilities.requestAward), async (request, response, next) => {
     if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the requesting agency can award an offer.');
-    const offerId = typeof request.body?.offer_id === 'string' ? request.body.offer_id : '';
-    if (!/^[0-9a-f-]{36}$/i.test(offerId)) return fail(response, 400, 'VALIDATION_ERROR', 'Choose an offer to award.');
-    const notSelectedReason = typeof request.body?.not_selected_reason === 'string' ? request.body.not_selected_reason.trim() : '';
-    if (notSelectedReason.length > 300) return fail(response, 400, 'VALIDATION_ERROR', 'Keep the not-selected reason under 300 characters.');
-    if (contactDetailsPattern.test(notSelectedReason)) return fail(response, 400, 'CONTACT_DETAILS_NOT_ALLOWED', 'Remove contact details and external links from the not-selected reason.');
+    const input = parseWith(awardSchema, request.body ?? {});
+    if (input.error) return fail(response, 400, 'VALIDATION_ERROR', input.error);
+    const { selections, notSelectedReason } = input.data;
+    if (containsContactDetails(notSelectedReason)) return fail(response, 400, 'CONTACT_DETAILS_NOT_ALLOWED', 'Remove contact details and external links from the not-selected reason.');
+    const requestId = request.params.requestId;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      const requestRow = await client.query("SELECT id FROM marketplace_requests WHERE id = $1 AND agency_organization_id = $2 AND status IN ('open', 'closed') FOR UPDATE", [request.params.requestId, request.auth.organization_id]);
-      if (!requestRow.rowCount) {
+      const reject = async (status, code, message) => {
         await client.query('ROLLBACK');
-        return fail(response, 404, 'REQUEST_NOT_AVAILABLE', 'This open or closed request was not found.');
+        return fail(response, status, code, message);
+      };
+      const requestRow = await client.query("SELECT id, request_code, destination FROM marketplace_requests WHERE id = $1 AND agency_organization_id = $2 AND status IN ('open', 'closed') FOR UPDATE", [requestId, request.auth.organization_id]);
+      if (!requestRow.rowCount) return reject(404, 'REQUEST_NOT_AVAILABLE', 'This open or closed request was not found.');
+      const winners = [];
+      for (const selection of selections) {
+        const selected = await client.query(
+          `SELECT f.id, f.seller_organization_id, f.confirmed_trip_version, f.option_label, r.trip_version
+           FROM offers f JOIN seller_profiles p ON p.organization_id = f.seller_organization_id
+           JOIN marketplace_requests r ON r.id = f.request_id
+           WHERE f.id = $1 AND f.request_id = $2 AND f.status IN ('submitted', 'shortlisted') AND p.verification_status = 'approved'`,
+          [selection.offer_id, requestId],
+        );
+        const offer = selected.rows[0];
+        if (!offer) return reject(404, 'OFFER_NOT_AVAILABLE', 'The selected offer is not available for this request.');
+        if (offer.confirmed_trip_version < offer.trip_version) return reject(409, 'OFFER_NEEDS_RECONFIRMATION', 'This offer was priced for earlier trip details. Wait for the seller to re-confirm it.');
+        const option = selection.offer_option_id ? await client.query('SELECT label FROM offer_options WHERE id = $1 AND offer_id = $2', [selection.offer_option_id, offer.id]) : null;
+        if (option && !option.rowCount) return reject(404, 'OPTION_NOT_AVAILABLE', 'This option is no longer part of the offer. Reload the offers and choose again.');
+        winners.push({ id: randomUUID(), offer, optionId: selection.offer_option_id, optionLabel: option ? option.rows[0].label : offer.option_label ?? null });
       }
-      const selected = await client.query(
-        `SELECT f.id, f.seller_organization_id FROM offers f JOIN seller_profiles p ON p.organization_id = f.seller_organization_id
-         WHERE f.id = $1 AND f.request_id = $2 AND f.status IN ('submitted', 'shortlisted') AND p.verification_status = 'approved'`,
-        [offerId, request.params.requestId],
-      );
-      if (!selected.rowCount) {
-        await client.query('ROLLBACK');
-        return fail(response, 404, 'OFFER_NOT_AVAILABLE', 'The selected offer is not available for this request.');
+      for (const winner of winners) {
+        await client.query(
+          'INSERT INTO awards (id, request_id, offer_id, offer_option_id, agency_organization_id, seller_organization_id) VALUES ($1, $2, $3, $4, $5, $6)',
+          [winner.id, requestId, winner.offer.id, winner.optionId, request.auth.organization_id, winner.offer.seller_organization_id],
+        );
       }
-      const awardId = randomUUID();
-      await client.query(
-        'INSERT INTO awards (id, request_id, offer_id, agency_organization_id, seller_organization_id) VALUES ($1, $2, $3, $4, $5)',
-        [awardId, request.params.requestId, offerId, request.auth.organization_id, selected.rows[0].seller_organization_id],
-      );
-      await client.query("UPDATE marketplace_requests SET status = 'awarded', updated_at = NOW() WHERE id = $1", [request.params.requestId]);
+      await client.query("UPDATE marketplace_requests SET status = 'awarded', updated_at = NOW() WHERE id = $1", [requestId]);
+      await client.query("UPDATE offer_negotiations SET status = 'closed', responded_at = NOW() WHERE status = 'open' AND offer_id IN (SELECT id FROM offers WHERE request_id = $1)", [requestId]);
+      const winningIds = winners.map((winner) => winner.offer.id);
       const outcomes = await client.query(
-        `UPDATE offers SET status = CASE WHEN id = $2 THEN 'accepted' ELSE 'rejected' END,
-           outcome_reason = CASE WHEN id = $2 THEN NULL ELSE $3::varchar END, updated_at = NOW()
-         WHERE request_id = $1 AND status IN ('submitted', 'shortlisted') RETURNING seller_organization_id, status`,
-        [request.params.requestId, offerId, notSelectedReason || null],
+        `UPDATE offers SET status = CASE WHEN id = ANY($2::uuid[]) THEN 'accepted' ELSE 'rejected' END,
+           outcome_reason = CASE WHEN id = ANY($2::uuid[]) THEN NULL ELSE $3::varchar END, updated_at = NOW()
+         WHERE request_id = $1 AND status IN ('submitted', 'shortlisted') RETURNING id, seller_organization_id, status`,
+        [requestId, winningIds, notSelectedReason],
       );
-      const requestDetails = await client.query('SELECT request_code, destination FROM marketplace_requests WHERE id = $1', [request.params.requestId]);
+      const { request_code: requestCode, destination } = requestRow.rows[0];
+      const summary = `${requestCode} / ${destination}`;
+      const split = winners.length > 1 ? ' / Shared award: you supply part of this trip' : '';
       for (const outcome of outcomes.rows) {
-        const selected = outcome.status === 'accepted';
-        const summary = `${requestDetails.rows[0].request_code} / ${requestDetails.rows[0].destination}`;
-        await notify(client, outcome.seller_organization_id, selected ? 'offer_awarded' : 'offer_not_selected', selected ? 'Your offer was awarded' : 'Offer not selected', selected || !notSelectedReason ? summary : `${summary} / Reason: ${notSelectedReason}`, { requestId: request.params.requestId, requestCode: requestDetails.rows[0].request_code, awardId, offerId: selected ? offerId : null });
+        const winner = winners.find((item) => item.offer.id === outcome.id);
+        if (winner) {
+          await notify(client, outcome.seller_organization_id, 'offer_awarded', 'Your offer was awarded', `${summary}${winner.optionLabel ? ` / Option: ${winner.optionLabel}` : ''}${split}`, { requestId, requestCode, awardId: winner.id, offerId: winner.offer.id, offerOptionId: winner.optionId });
+        } else {
+          await notify(client, outcome.seller_organization_id, 'offer_not_selected', 'Offer not selected', notSelectedReason ? `${summary} / Reason: ${notSelectedReason}` : summary, { requestId, requestCode, awardId: null, offerId: null, offerOptionId: null });
+        }
       }
       await client.query('COMMIT');
-      return response.status(201).json({ award: { id: awardId, requestId: request.params.requestId, offerId, sellerOrganizationId: selected.rows[0].seller_organization_id, status: 'awarded' } });
+      const awards = winners.map((winner) => ({ id: winner.id, requestId, offerId: winner.offer.id, offerOptionId: winner.optionId, optionLabel: winner.optionLabel, sellerOrganizationId: winner.offer.seller_organization_id, status: 'awarded' }));
+      return response.status(201).json({ award: awards[0], awards, undoUntil: new Date(Date.now() + config.awards.undoWindowMs).toISOString() });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      return next(error);
+    } finally {
+      client.release();
+    }
+  });
+
+  // Reverses the whole award decision while no booking step has started; offers become active again.
+  router.post('/requests/:requestId/award/undo', requireCapability(capabilities.requestAward), async (request, response, next) => {
+    if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the requesting agency can undo its award.');
+    const input = parseWith(undoAwardSchema, request.body ?? {});
+    if (input.error) return fail(response, 400, 'VALIDATION_ERROR', input.error);
+    const requestId = request.params.requestId;
+    if (!uuidPattern.test(requestId)) return fail(response, 404, 'REQUEST_NOT_AWARDED', 'This awarded request was not found.');
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const reject = async (status, code, message) => {
+        await client.query('ROLLBACK');
+        return fail(response, status, code, message);
+      };
+      const requestRow = await client.query(
+        "SELECT id, request_code, destination, closed_at, response_deadline FROM marketplace_requests WHERE id = $1 AND agency_organization_id = $2 AND status = 'awarded' FOR UPDATE",
+        [requestId, request.auth.organization_id],
+      );
+      if (!requestRow.rowCount) return reject(404, 'REQUEST_NOT_AWARDED', 'This awarded request was not found.');
+      const awards = await client.query('SELECT * FROM awards WHERE request_id = $1 ORDER BY created_at FOR UPDATE', [requestId]);
+      if (awards.rows.some((award) => award.status !== 'awarded')) return reject(409, 'AWARD_IN_PROGRESS', 'A booking was already confirmed for this award, so it can no longer be undone.');
+      const awardedAt = new Date(awards.rows[0].created_at);
+      if (Date.now() - awardedAt.getTime() > config.awards.undoWindowMs) return reject(409, 'UNDO_WINDOW_PASSED', `Awards can only be undone within ${config.awards.undoWindowMs / 60000} minutes.`);
+
+      await client.query(
+        'INSERT INTO award_reversals (id, request_id, agency_organization_id, undone_by_user_id, reason, awards, awarded_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+        [randomUUID(), requestId, request.auth.organization_id, request.auth.user_id, input.data.reason, JSON.stringify(awards.rows), awardedAt],
+      );
+      await client.query('DELETE FROM awards WHERE request_id = $1', [requestId]);
+      const { closed_at: closedAt, response_deadline: deadline, request_code: requestCode, destination } = requestRow.rows[0];
+      const reopened = !closedAt && new Date(deadline) > new Date();
+      await client.query(
+        "UPDATE marketplace_requests SET status = CASE WHEN $2 THEN 'open' ELSE 'closed' END, closed_at = CASE WHEN $2 THEN NULL ELSE COALESCE(closed_at, NOW()) END, updated_at = NOW() WHERE id = $1",
+        [requestId, reopened],
+      );
+      const restored = await client.query(
+        "UPDATE offers SET status = 'submitted', outcome_reason = NULL, updated_at = NOW() WHERE request_id = $1 AND status IN ('accepted', 'rejected') RETURNING seller_organization_id",
+        [requestId],
+      );
+      for (const offer of restored.rows) {
+        await notify(client, offer.seller_organization_id, 'award_undone', 'Agency reopened its decision', `${requestCode} / ${destination} / The award was undone and your offer is active again.${input.data.reason ? ` Reason: ${input.data.reason}` : ''}`, { requestId, requestCode });
+      }
+      await client.query('COMMIT');
+      return response.json({ requestId, status: reopened ? 'open' : 'closed', restoredOffers: restored.rowCount });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       return next(error);
@@ -985,18 +1493,21 @@ export function createMarketplaceRouter({ pool }) {
   router.get('/awards/:awardId', async (request, response, next) => {
     try {
       const result = await pool.query(
-        `SELECT a.id, a.request_id, r.request_code, r.destination, a.offer_id, a.status,
+        `SELECT a.id, a.request_id, r.request_code, r.destination, a.offer_id, a.offer_option_id, a.status,
+                COALESCE(opt.label, f.option_label) AS option_label,
                 a.created_at, a.booking_confirmed_at, a.agency_organization_id,
                 a.seller_organization_id, o.name AS seller_name,
                 (g.award_id IS NOT NULL AND g.revoked_at IS NULL AND g.purged_at IS NULL) AS guest_details_released
          FROM awards a JOIN marketplace_requests r ON r.id = a.request_id
+         JOIN offers f ON f.id = a.offer_id
+         LEFT JOIN offer_options opt ON opt.id = a.offer_option_id
          JOIN organizations o ON o.id = a.seller_organization_id
          LEFT JOIN booking_guest_details g ON g.award_id = a.id WHERE a.id = $1`,
         [request.params.awardId],
       );
       const award = result.rows[0];
       if (!award || (award.agency_organization_id !== request.auth.organization_id && award.seller_organization_id !== request.auth.organization_id)) return fail(response, 404, 'AWARD_NOT_FOUND', 'Award was not found.');
-      return response.json({ award: { id: award.id, requestId: award.request_id, requestCode: award.request_code, destination: award.destination, offerId: award.offer_id, sellerName: award.seller_name, status: award.status, createdAt: award.created_at, bookingConfirmedAt: award.booking_confirmed_at, guestDetailsReleased: Boolean(award.guest_details_released) } });
+      return response.json({ award: { id: award.id, requestId: award.request_id, requestCode: award.request_code, destination: award.destination, offerId: award.offer_id, offerOptionId: award.offer_option_id ?? null, optionLabel: award.option_label ?? null, sellerName: award.seller_name, status: award.status, createdAt: award.created_at, bookingConfirmedAt: award.booking_confirmed_at, guestDetailsReleased: Boolean(award.guest_details_released) } });
     } catch (error) {
       return next(error);
     }

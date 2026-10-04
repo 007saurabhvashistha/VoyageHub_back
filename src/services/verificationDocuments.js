@@ -2,10 +2,43 @@ import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
 import { create as contentDisposition } from 'content-disposition';
 import { fileTypeFromBuffer } from 'file-type';
+import { z } from 'zod';
 import { config } from '../config/index.js';
 import { verificationDocumentRequirements, verificationDocumentTypes } from '../config/referenceData.js';
 
 const documentLabels = new Map(verificationDocumentTypes.map((type) => [type.value, type.label]));
+
+export const verificationDecisionSchema = z.object({
+  decision: z.enum(['approved', 'rejected'], { error: 'Decision must be approved or rejected.' }),
+  reason: z.string({ error: 'Provide a review reason between 5 and 500 characters.' }).trim()
+    .min(5, 'Provide a review reason between 5 and 500 characters.')
+    .max(500, 'Provide a review reason between 5 and 500 characters.'),
+});
+
+export function agencyVerificationDto(row) {
+  return {
+    status: row?.status ?? 'unsubmitted',
+    reason: row?.reason ?? null,
+    submittedAt: row?.submitted_at ?? null,
+    decidedAt: row?.decided_at ?? null,
+  };
+}
+
+// Agencies get their verification row on first use; the caller must be inside a transaction.
+export async function lockAgencyVerification(client, organizationId) {
+  await client.query('INSERT INTO agency_verifications (organization_id) VALUES ($1) ON CONFLICT (organization_id) DO NOTHING', [organizationId]);
+  const result = await client.query('SELECT * FROM agency_verifications WHERE organization_id = $1 FOR UPDATE', [organizationId]);
+  return result.rows[0];
+}
+
+export async function verificationStateFor(db, { organizationId, businessType }) {
+  if (businessType === 'agency') {
+    const result = await db.query('SELECT * FROM agency_verifications WHERE organization_id = $1', [organizationId]);
+    return agencyVerificationDto(result.rows[0]);
+  }
+  const result = await db.query('SELECT verification_status, verification_reason FROM seller_profiles WHERE organization_id = $1', [organizationId]);
+  return { status: result.rows[0]?.verification_status ?? null, reason: result.rows[0]?.verification_reason ?? null, submittedAt: null, decidedAt: null };
+}
 
 export function documentRequirementsFor(businessType, countryCode) {
   const rule = verificationDocumentRequirements.find((row) => row.businessType === businessType && row.countryCode === countryCode)
@@ -51,7 +84,15 @@ export async function verificationDocumentStatus(db, { organizationId, businessT
   const missing = requirements
     .filter((item) => item.required && !(item.document?.scanStatus === 'clean' && !item.document.removedAt))
     .map((item) => item.type);
-  return { requirements, complete: missing.length === 0, missing };
+  // Submitting for review only needs a usable upload; approval still waits for a clean scan.
+  const notUploaded = requirements
+    .filter((item) => item.required && !(['pending', 'clean'].includes(item.document?.scanStatus) && !item.document.removedAt))
+    .map((item) => item.type);
+  return { requirements, complete: missing.length === 0, missing, notUploaded };
+}
+
+export function requirementLabels(status, types) {
+  return status.requirements.filter((item) => types.includes(item.type)).map((item) => item.label);
 }
 
 // Identifies the file from its content; the client-supplied type and extension are ignored.

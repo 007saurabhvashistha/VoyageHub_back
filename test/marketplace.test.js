@@ -1055,7 +1055,7 @@ async function uploadDocument(baseUrl, account, documentType, body, { filename =
   const form = new FormData();
   if (documentType) form.append('document_type', documentType);
   form.append('file', new Blob([body]), filename);
-  const response = await fetch(`${baseUrl}/v1/seller-documents`, {
+  const response = await fetch(`${baseUrl}/v1/verification-documents`, {
     method: 'POST',
     headers: { cookie: account.cookie, ...(csrf ? { 'x-csrf-token': account.session.csrfToken } : {}) },
     body: form,
@@ -1073,8 +1073,8 @@ test('seller documents are type-checked, malware-scanned, required for approval 
   const scanner = { scan: async (body) => body.includes('FAKE-MALWARE-MARKER') ? { infected: true, signature: 'Test.Marker' } : { infected: false } };
   const decide = (decision, reason) => api(baseUrl, `/v1/admin/seller-profiles/${dmcId}/decision`, admin, { method: 'POST', body: { decision, reason } });
 
-  assert.equal((await api(baseUrl, '/v1/seller-documents', agency)).response.status, 403);
-  const initial = await api(baseUrl, '/v1/seller-documents', dmc);
+  assert.deepEqual((await api(baseUrl, '/v1/verification-documents', agency)).body.missing, ['gst_certificate', 'pan_card', 'business_registration']);
+  const initial = await api(baseUrl, '/v1/verification-documents', dmc);
   assert.equal(initial.body.storageConfigured, true);
   assert.deepEqual(initial.body.missing, ['gst_certificate', 'pan_card', 'business_registration']);
   assert.equal((await decide('approved', 'Looks fine.')).body.error.code, 'DOCUMENTS_INCOMPLETE');
@@ -1097,7 +1097,7 @@ test('seller documents are type-checked, malware-scanned, required for approval 
   assert.deepEqual(await processDocumentScans(pool, { storage, scanner }), { clean: 2, infected: 1, retrying: 0, failed: 0 });
   assert.deepEqual(await processDocumentScans(pool, { storage, scanner }), { clean: 0, infected: 0, retrying: 0, failed: 0 });
   assert.equal(storage.objects.size, 2);
-  const afterScan = await api(baseUrl, '/v1/seller-documents', dmc);
+  const afterScan = await api(baseUrl, '/v1/verification-documents', dmc);
   assert.deepEqual(afterScan.body.missing, ['pan_card']);
   const panSlot = afterScan.body.requirements.find((item) => item.type === 'pan_card');
   assert.deepEqual([panSlot.document.id, panSlot.document.scanStatus, Boolean(panSlot.document.removedAt)], [pan.body.document.id, 'infected', true]);
@@ -1115,7 +1115,7 @@ test('seller documents are type-checked, malware-scanned, required for approval 
   await processDocumentScans(pool, { storage, scanner });
   assert.equal((await decide('approved', 'All documents reviewed.')).response.status, 200);
 
-  const adminView = await api(baseUrl, `/v1/admin/seller-profiles/${dmcId}/documents`, admin);
+  const adminView = await api(baseUrl, `/v1/admin/organizations/${dmcId}/documents`, admin);
   assert.equal(adminView.body.complete, true);
   assert.equal(adminView.body.history.length, 4);
   assert.ok(adminView.body.history.find((item) => item.id === pan.body.document.id).supersededAt);
@@ -1141,6 +1141,300 @@ test('seller documents are type-checked, malware-scanned, required for approval 
   const remaining = await pool.query('SELECT COUNT(*)::int AS count FROM organization_documents WHERE organization_id = $1 AND deleted_at IS NULL', [hotel.session.organization.id]);
   assert.equal(remaining.rows[0].count, 0);
   assert.equal((await pool.query('SELECT COUNT(*)::int AS count FROM organization_documents WHERE organization_id = $1 AND deleted_at IS NULL', [dmcId])).rows[0].count, 4);
+});
+
+test('agencies upload verification documents, submit them for review and earn the verified badge', async (context) => {
+  const { pool, baseUrl, storage } = await startMarketplaceApp(context);
+  const admin = await register(baseUrl, { name: 'Agency Reviewer', organization: 'Review Ops', email: 'agency-review-admin@example.test', role: 'agency', countryCode: 'IN' });
+  await promoteTestAdmin(pool, admin);
+  const agency = await register(baseUrl, { name: 'Agency Owner', organization: 'Mumbai Journeys', email: 'agency-verify@example.test', role: 'agency', countryCode: 'IN' });
+  const agencyId = agency.session.organization.id;
+  const dmc = await register(baseUrl, { name: 'Kyoto Seller', organization: 'Kyoto Verified DMC', email: 'agency-verify-dmc@example.test', role: 'dmc', countryCode: 'JP', coverage: 'kyoto' });
+  await api(baseUrl, `/v1/admin/seller-profiles/${dmc.session.organization.id}/decision`, admin, { method: 'POST', body: { decision: 'approved', reason: 'Seller documents reviewed.' } });
+  const scanner = { scan: async (body) => body.includes('FAKE-MALWARE-MARKER') ? { infected: true, signature: 'Test.Marker' } : { infected: false } };
+  const submit = () => api(baseUrl, '/v1/verification-documents/submit', agency, { method: 'POST', body: {} });
+  const decide = (decision, reason) => api(baseUrl, `/v1/admin/agency-verifications/${agencyId}/decision`, admin, { method: 'POST', body: { decision, reason } });
+
+  const draft = await api(baseUrl, '/v1/marketplace/requests', agency, { method: 'POST', body: requestInput() });
+  const requestId = draft.body.request.id;
+  await api(baseUrl, `/v1/marketplace/requests/${requestId}/publish`, agency, { method: 'POST', body: {} });
+  assert.equal((await api(baseUrl, '/v1/marketplace/requests', dmc)).body.requests[0].agencyVerified, false);
+
+  const initial = await api(baseUrl, '/v1/verification-documents', agency);
+  assert.equal(initial.body.verification.status, 'unsubmitted');
+  assert.deepEqual(initial.body.missing, ['gst_certificate', 'pan_card', 'business_registration']);
+  assert.equal((await api(baseUrl, '/v1/verification-documents/submit', dmc, { method: 'POST', body: {} })).response.status, 403);
+  const early = await submit();
+  assert.equal(early.body.error.code, 'DOCUMENTS_INCOMPLETE');
+  assert.match(early.body.error.message, /GST registration certificate/);
+
+  await uploadDocument(baseUrl, agency, 'gst_certificate', pdfBytes('agency gst'));
+  const pan = await uploadDocument(baseUrl, agency, 'pan_card', pdfBytes('FAKE-MALWARE-MARKER'));
+  assert.equal(pan.body.verificationStatus, 'unsubmitted');
+  await uploadDocument(baseUrl, agency, 'business_registration', pdfBytes('agency registration'));
+  const submitted = await submit();
+  assert.equal(submitted.response.status, 200);
+  assert.equal(submitted.body.verification.status, 'pending');
+  assert.equal((await submit()).body.error.code, 'VERIFICATION_ALREADY_SUBMITTED');
+
+  assert.equal((await api(baseUrl, '/v1/admin/agency-verifications/pending', agency)).response.status, 403);
+  const queue = await api(baseUrl, '/v1/admin/agency-verifications/pending', admin);
+  assert.deepEqual(queue.body.agencies.map((item) => [item.organizationName, item.status, item.documents.complete]), [['Mumbai Journeys', 'pending', false]]);
+
+  assert.deepEqual(await processDocumentScans(pool, { storage, scanner }), { clean: 2, infected: 1, retrying: 0, failed: 0 });
+  assert.equal((await decide('approved', 'x')).response.status, 400);
+  const incomplete = await decide('approved', 'Documents reviewed.');
+  assert.equal(incomplete.body.error.code, 'DOCUMENTS_INCOMPLETE');
+  assert.match(incomplete.body.error.message, /Business PAN card/);
+  assert.equal((await decide('rejected', 'PAN card failed the malware scan.')).response.status, 200);
+  const rejected = await api(baseUrl, '/v1/verification-documents', agency);
+  assert.deepEqual([rejected.body.verification.status, rejected.body.verification.reason], ['rejected', 'PAN card failed the malware scan.']);
+  assert.equal((await decide('approved', 'Too late for this one.')).body.error.code, 'PENDING_AGENCY_NOT_FOUND');
+
+  const replacement = await uploadDocument(baseUrl, agency, 'pan_card', pdfBytes('clean agency pan'));
+  assert.equal(replacement.body.verificationStatus, 'unsubmitted');
+  await processDocumentScans(pool, { storage, scanner });
+  assert.equal((await submit()).body.verification.status, 'pending');
+  const approved = await decide('approved', 'GST, PAN and registration verified.');
+  assert.equal(approved.response.status, 200);
+  assert.equal(approved.body.verification.status, 'approved');
+  assert.equal((await submit()).body.error.code, 'AGENCY_ALREADY_VERIFIED');
+  assert.ok((await pool.query('SELECT verified_at FROM organizations WHERE id = $1', [agencyId])).rows[0].verified_at);
+  assert.equal((await api(baseUrl, '/v1/marketplace/requests', dmc)).body.requests[0].agencyVerified, true);
+  assert.equal((await api(baseUrl, `/v1/marketplace/requests/${requestId}`, dmc)).body.request.agencyVerified, true);
+  const notices = (await api(baseUrl, '/v1/notifications', agency)).body.notifications.filter((item) => item.type === 'agency_verification_decided');
+  assert.deepEqual(notices.map((item) => item.title), ['Agency verified', 'Agency verification not approved']);
+  assert.equal((await pool.query('SELECT COUNT(*)::int AS count FROM agency_verification_reviews WHERE agency_organization_id = $1', [agencyId])).rows[0].count, 2);
+  const adminView = await api(baseUrl, `/v1/admin/organizations/${agencyId}/documents`, admin);
+  assert.deepEqual([adminView.body.complete, adminView.body.history.length], [true, 4]);
+  assert.equal((await api(baseUrl, '/v1/admin/agency-verifications/pending', admin)).body.agencies.length, 0);
+
+  const other = await register(baseUrl, { name: 'Rejected Owner', organization: 'Rejected Agency', email: 'agency-rejected@example.test', role: 'agency', countryCode: 'IN' });
+  const otherId = other.session.organization.id;
+  await seedCleanDocuments(pool, otherId, 'agency', 'IN');
+  await api(baseUrl, '/v1/verification-documents/submit', other, { method: 'POST', body: {} });
+  await api(baseUrl, `/v1/admin/agency-verifications/${otherId}/decision`, admin, { method: 'POST', body: { decision: 'rejected', reason: 'Registration does not match the business name.' } });
+  assert.deepEqual(await processDocumentRetention(pool, { storage }), { deletedDocuments: 0, failures: 0 });
+  await pool.query("UPDATE agency_verifications SET decided_at = NOW() - INTERVAL '91 days' WHERE organization_id = $1", [otherId]);
+  assert.deepEqual(await processDocumentRetention(pool, { storage }), { deletedDocuments: 3, failures: 0 });
+  assert.equal((await pool.query('SELECT COUNT(*)::int AS count FROM organization_documents WHERE organization_id = $1 AND deleted_at IS NULL', [agencyId])).rows[0].count, 3);
+});
+
+test('changing published trip details makes sellers re-confirm before an offer can be awarded', async (context) => {
+  const { pool, baseUrl } = await startMarketplaceApp(context);
+  const admin = await register(baseUrl, { name: 'Trip Admin', organization: 'Trip Ops', email: 'trip-admin@example.test', role: 'agency', countryCode: 'IN' });
+  await promoteTestAdmin(pool, admin);
+  const agency = await register(baseUrl, { name: 'Trip Agent', organization: 'Trip Agency', email: 'trip-agency@example.test', role: 'agency', countryCode: 'IN' });
+  const dmc = await register(baseUrl, { name: 'Trip DMC', organization: 'Kyoto Trip DMC', email: 'trip-dmc@example.test', role: 'dmc', countryCode: 'JP', coverage: 'kyoto' });
+  const hotel = await register(baseUrl, { name: 'Trip Hotel', organization: 'Kyoto Trip Inn', email: 'trip-hotel@example.test', role: 'hotelier', countryCode: 'JP', propertyCity: 'Kyoto' });
+  const latecomer = await register(baseUrl, { name: 'Late DMC', organization: 'Late Kyoto DMC', email: 'trip-late@example.test', role: 'dmc', countryCode: 'JP', coverage: 'kyoto' });
+  for (const seller of [dmc, hotel, latecomer]) {
+    await api(baseUrl, `/v1/admin/seller-profiles/${seller.session.organization.id}/decision`, admin, { method: 'POST', body: { decision: 'approved', reason: 'Business details reviewed.' } });
+  }
+  const draft = await api(baseUrl, '/v1/marketplace/requests', agency, { method: 'POST', body: requestInput() });
+  const requestId = draft.body.request.id;
+  assert.equal(draft.body.request.tripVersion, 1);
+  const tripPath = `/v1/marketplace/requests/${requestId}/trip`;
+  const change = { travel_start_date: '2027-04-15', travel_end_date: '2027-04-22', nights: 7, adults: 3, children: 1, infants: 0, room_count: 2, trip_version: 1, note: 'Client added a guest and moved the trip by a day.' };
+  assert.equal((await api(baseUrl, tripPath, agency, { method: 'PATCH', body: change })).body.error.code, 'REQUEST_NOT_OPEN');
+  await api(baseUrl, `/v1/marketplace/requests/${requestId}/publish`, agency, { method: 'POST', body: {} });
+
+  const validityUntil = new Date(Date.now() + 5 * 86400000).toISOString();
+  const dmcOffer = await api(baseUrl, `/v1/marketplace/requests/${requestId}/offers`, dmc, { method: 'POST', body: { total_minor: 200000, currency: 'USD', inclusions: ['guide'], exclusions: [], validity_until: validityUntil, trip_version: 1 } });
+  assert.equal(dmcOffer.response.status, 201);
+  const hotelOffer = await api(baseUrl, `/v1/marketplace/requests/${requestId}/offers`, hotel, { method: 'POST', body: { rate_per_night_minor: 18500, room_type: 'Garden Twin', currency: 'JPY', inclusions: [], exclusions: [], validity_until: validityUntil, room_count: 1, availability_confirmed: true } });
+  const dmcOfferId = dmcOffer.body.offer.id;
+  const hotelOfferId = hotelOffer.body.offer.id;
+
+  const patch = (account, body) => api(baseUrl, tripPath, account, { method: 'PATCH', body });
+  assert.equal((await patch(dmc, change)).response.status, 403);
+  assert.equal((await patch(agency, { ...change, trip_version: 2 })).body.error.code, 'TRIP_CHANGED');
+  assert.equal((await patch(agency, { ...change, trip_version: undefined })).response.status, 400);
+  const original = requestInput();
+  assert.equal((await patch(agency, { ...original, trip_version: 1 })).body.error.code, 'NO_TRIP_CHANGES');
+  assert.match((await patch(agency, { ...change, nights: 5 })).body.error.message, /match the selected travel dates/);
+  assert.equal((await patch(agency, { ...change, note: 'Call 9876543210 for details' })).body.error.code, 'CONTACT_DETAILS_NOT_ALLOWED');
+  assert.match((await patch(agency, { ...change, response_deadline: new Date(Date.now() + 24 * 3600000).toISOString() })).body.error.message, /not shortened/);
+  await pool.query("UPDATE marketplace_requests SET response_deadline = NOW() + INTERVAL '20 minutes' WHERE id = $1", [requestId]);
+  assert.equal((await patch(agency, change)).body.error.code, 'DEADLINE_TOO_CLOSE');
+
+  const changed = await patch(agency, { ...change, response_deadline: new Date(Date.now() + 72 * 3600000).toISOString() });
+  assert.equal(changed.response.status, 200);
+  assert.deepEqual([changed.body.request.tripVersion, changed.body.request.adults, changed.body.request.roomCount, changed.body.offersAwaitingReconfirmation], [2, 3, 2, 2]);
+  assert.deepEqual([changed.body.request.tripChange.previous.travelers, changed.body.request.tripChange.current.travelers], ['2 adults', '3 adults, 1 children']);
+  assert.equal((await patch(agency, { ...change, adults: 4 })).body.error.code, 'TRIP_CHANGED');
+
+  const sellerDetail = await api(baseUrl, `/v1/marketplace/requests/${requestId}`, dmc);
+  assert.deepEqual([sellerDetail.body.request.adults, sellerDetail.body.request.tripVersion, sellerDetail.body.request.travelStartDate], [3, 2, '2027-04-15']);
+  assert.equal(sellerDetail.body.request.tripChange.previous.dates, '2027-04-14 - 2027-04-21');
+  assert.equal(sellerDetail.body.request.tripChange.note, change.note);
+  const dmcInbox = (await api(baseUrl, '/v1/marketplace/requests', dmc)).body.requests[0];
+  assert.deepEqual([dmcInbox.needsReconfirmation, dmcInbox.myOfferId, dmcInbox.tripChange.version], [true, dmcOfferId, 2]);
+  const lateInbox = (await api(baseUrl, '/v1/marketplace/requests', latecomer)).body.requests[0];
+  assert.deepEqual([lateInbox.needsReconfirmation, lateInbox.hasActiveOffer], [false, false]);
+  const titles = async (account) => (await api(baseUrl, '/v1/notifications', account)).body.notifications.filter((item) => item.type === 'request_trip_changed').map((item) => item.title);
+  assert.deepEqual(await titles(dmc), ['Trip changed: re-confirm your offer']);
+  assert.deepEqual(await titles(latecomer), ['Trip details changed']);
+  assert.equal((await api(baseUrl, '/v1/marketplace/offers', dmc)).body.offers[0].needsReconfirmation, true);
+
+  const comparison = await api(baseUrl, `/v1/marketplace/requests/${requestId}/offers`, agency);
+  assert.deepEqual(comparison.body.offers.map((offer) => offer.needsReconfirmation), [true, true]);
+  assert.equal((await api(baseUrl, `/v1/marketplace/requests/${requestId}/award`, agency, { method: 'POST', body: { offer_id: dmcOfferId } })).body.error.code, 'OFFER_NEEDS_RECONFIRMATION');
+
+  const reconfirm = (account, offerId, body) => api(baseUrl, `/v1/marketplace/offers/${offerId}/reconfirm`, account, { method: 'POST', body });
+  assert.equal((await reconfirm(dmc, dmcOfferId, {})).response.status, 400);
+  assert.equal((await reconfirm(dmc, dmcOfferId, { trip_version: 1 })).body.error.code, 'TRIP_CHANGED');
+  assert.equal((await reconfirm(hotel, dmcOfferId, { trip_version: 2 })).response.status, 404);
+  const reconfirmed = await reconfirm(dmc, dmcOfferId, { trip_version: 2 });
+  assert.equal(reconfirmed.response.status, 200);
+  assert.deepEqual([reconfirmed.body.offer.needsReconfirmation, reconfirmed.body.offer.confirmedTripVersion, reconfirmed.body.offer.totalMinor], [false, 2, 200000]);
+  assert.equal((await reconfirm(dmc, dmcOfferId, { trip_version: 2 })).body.error.code, 'OFFER_ALREADY_CONFIRMED');
+  assert.equal((await api(baseUrl, `/v1/marketplace/offers/${dmcOfferId}/revisions`, dmc)).body.revisions[0].snapshot.confirmedTripVersion, 1);
+  assert.ok((await api(baseUrl, '/v1/notifications', agency)).body.notifications.some((item) => item.type === 'offer_reconfirmed'));
+
+  const hotelRevision = { rate_per_night_minor: 19500, room_type: 'Garden Twin', currency: 'JPY', inclusions: [], exclusions: [], validity_until: validityUntil, room_count: 2, availability_confirmed: true };
+  const revise = (body) => api(baseUrl, `/v1/marketplace/offers/${hotelOfferId}`, hotel, { method: 'PUT', body });
+  assert.equal((await revise({ ...hotelRevision, trip_version: 1 })).body.error.code, 'TRIP_CHANGED');
+  assert.equal((await revise(hotelRevision)).body.offer.needsReconfirmation, true);
+  assert.equal((await revise({ ...hotelRevision, trip_version: 2 })).body.offer.needsReconfirmation, false);
+
+  const lateBody = { total_minor: 210000, currency: 'USD', inclusions: [], exclusions: [], validity_until: validityUntil };
+  assert.equal((await api(baseUrl, `/v1/marketplace/requests/${requestId}/offers`, latecomer, { method: 'POST', body: { ...lateBody, trip_version: 1 } })).body.error.code, 'TRIP_CHANGED');
+  const lateOffer = await api(baseUrl, `/v1/marketplace/requests/${requestId}/offers`, latecomer, { method: 'POST', body: { ...lateBody, trip_version: 2 } });
+  assert.equal(lateOffer.body.offer.confirmedTripVersion, 2);
+
+  const agencyView = await api(baseUrl, `/v1/marketplace/requests/${requestId}`, agency);
+  assert.deepEqual(agencyView.body.request.tripChanges.map((item) => [item.version, item.previous.adults, item.current.adults]), [[2, 2, 3]]);
+  assert.equal((await api(baseUrl, `/v1/marketplace/requests/${requestId}/award`, agency, { method: 'POST', body: { offer_id: dmcOfferId } })).response.status, 201);
+  assert.equal((await patch(agency, { ...change, adults: 4, trip_version: 2 })).body.error.code, 'REQUEST_NOT_OPEN');
+});
+
+test('sellers quote alternative options in one offer and the agency awards a specific option', async (context) => {
+  const { pool, baseUrl } = await startMarketplaceApp(context);
+  const admin = await register(baseUrl, { name: 'Option Admin', organization: 'Option Ops', email: 'option-admin@example.test', role: 'agency', countryCode: 'IN' });
+  await promoteTestAdmin(pool, admin);
+  const agency = await register(baseUrl, { name: 'Option Agent', organization: 'Option Agency', email: 'option-agency@example.test', role: 'agency', countryCode: 'IN' });
+  const dmc = await register(baseUrl, { name: 'Option DMC', organization: 'Kyoto Option DMC', email: 'option-dmc@example.test', role: 'dmc', countryCode: 'JP', coverage: 'kyoto' });
+  const hotel = await register(baseUrl, { name: 'Option Hotel', organization: 'Kyoto Option Inn', email: 'option-hotel@example.test', role: 'hotelier', countryCode: 'JP', propertyCity: 'Kyoto' });
+  await approveSellers(baseUrl, admin, [dmc, hotel]);
+  const reference = await (await fetch(`${baseUrl}/v1/reference-data`)).json();
+  assert.equal(reference.limits.maxOfferOptions, 3);
+
+  const draft = await api(baseUrl, '/v1/marketplace/requests', agency, { method: 'POST', body: requestInput() });
+  const requestId = draft.body.request.id;
+  await api(baseUrl, `/v1/marketplace/requests/${requestId}/publish`, agency, { method: 'POST', body: {} });
+  const validityUntil = new Date(Date.now() + 5 * 86400000).toISOString();
+  const threeStar = { label: '3 star', hotel_category: 3, total_minor: 160000 };
+  const fiveStar = { label: '5 star', hotel_category: 5, total_minor: 260000, notes: 'Ryokan with a private onsen.' };
+  const landOffer = (overrides = {}) => ({ total_minor: 200000, hotel_category: 4, option_label: '4 star', currency: 'INR', inclusions: ['accommodation'], validity_until: validityUntil, options: [threeStar, fiveStar], ...overrides });
+  const submit = (account, body) => api(baseUrl, `/v1/marketplace/requests/${requestId}/offers`, account, { method: 'POST', body });
+
+  assert.match((await submit(dmc, landOffer({ option_label: null }))).body.error.message, /Name the main option/);
+  assert.match((await submit(dmc, landOffer({ options: [threeStar, { ...fiveStar, label: '4 STAR' }] }))).body.error.message, /different name/);
+  assert.match((await submit(dmc, landOffer({ options: [threeStar, fiveStar, { ...threeStar, label: 'A' }, { ...threeStar, label: 'B' }] }))).body.error.message, /at most 3/);
+  assert.match((await submit(dmc, landOffer({ options: [{ ...fiveStar, notes: 'Book at www.example.com' }] }))).body.error.message, /contact details/);
+  assert.match((await submit(dmc, landOffer({ options: [{ ...threeStar, hotel_category: 2 }] }))).body.error.message, /hotel category/);
+  const created = await submit(dmc, landOffer());
+  assert.equal(created.response.status, 201);
+  assert.deepEqual(created.body.offer.options.map((option) => [option.label, option.hotelCategory, option.totalMinor]), [['3 star', 3, 160000], ['5 star', 5, 260000]]);
+  const hotelOffer = await submit(hotel, { rate_per_night_minor: 18000, room_type: 'Deluxe Twin', option_label: 'Deluxe', currency: 'INR', room_count: 1, validity_until: validityUntil, options: [{ label: 'Suite', room_type: 'Garden Suite', rate_per_night_minor: 30000, meal_plan: 'half_board' }] });
+  assert.equal(hotelOffer.response.status, 201);
+
+  const comparison = await api(baseUrl, `/v1/marketplace/requests/${requestId}/offers`, agency);
+  const comparedLand = comparison.body.offers.find((offer) => offer.kind === 'land_package');
+  const comparedRoom = comparison.body.offers.find((offer) => offer.kind === 'hotel_room');
+  assert.deepEqual([comparedLand.optionLabel, comparedLand.hotelCategory, comparedLand.options[1].perTravellerMinor], ['4 star', 4, 130000]);
+  assert.deepEqual([comparedRoom.options[0].roomType, comparedRoom.options[0].mealPlan, comparedRoom.options[0].estimatedTotalMinor], ['Garden Suite', 'half_board', 210000]);
+
+  const revised = await api(baseUrl, `/v1/marketplace/offers/${created.body.offer.id}`, dmc, { method: 'PUT', body: landOffer({ options: [{ ...fiveStar, total_minor: 250000 }] }) });
+  assert.deepEqual(revised.body.offer.options.map((option) => option.totalMinor), [250000]);
+  const history = await api(baseUrl, `/v1/marketplace/offers/${created.body.offer.id}/revisions`, dmc);
+  assert.equal(history.body.revisions[0].snapshot.options.length, 2);
+
+  const award = (body) => api(baseUrl, `/v1/marketplace/requests/${requestId}/award`, agency, { method: 'POST', body });
+  const landOfferId = created.body.offer.id;
+  assert.equal((await award({ offer_id: landOfferId, offer_option_id: 'five-star' })).response.status, 400);
+  assert.equal((await award({ offer_id: landOfferId, offer_option_id: comparedRoom.options[0].id })).body.error.code, 'OPTION_NOT_AVAILABLE');
+  assert.equal((await award({ offer_id: landOfferId, offer_option_id: comparedLand.options[1].id })).body.error.code, 'OPTION_NOT_AVAILABLE');
+  const awarded = await award({ offer_id: landOfferId, offer_option_id: revised.body.offer.options[0].id });
+  assert.equal(awarded.response.status, 201);
+  assert.equal(awarded.body.award.optionLabel, '5 star');
+  assert.ok((await api(baseUrl, '/v1/notifications', dmc)).body.notifications.some((item) => item.type === 'offer_awarded' && item.message.endsWith('Option: 5 star')));
+  assert.equal((await api(baseUrl, `/v1/marketplace/awards/${awarded.body.award.id}`, dmc)).body.award.optionLabel, '5 star');
+  const booking = await api(baseUrl, `/v1/bookings/${awarded.body.award.id}`, agency);
+  assert.deepEqual([booking.body.booking.offer.optionLabel, booking.body.booking.offer.totalMinor, booking.body.booking.offer.hotelCategory], ['5 star', 250000, 5]);
+});
+
+test('agencies request revisions and send counter-offers; sellers accept, decline or revise even after closing', async (context) => {
+  const { pool, baseUrl } = await startMarketplaceApp(context);
+  const admin = await register(baseUrl, { name: 'Deal Admin', organization: 'Deal Ops', email: 'deal-admin@example.test', role: 'agency', countryCode: 'IN' });
+  await promoteTestAdmin(pool, admin);
+  const agency = await register(baseUrl, { name: 'Deal Agent', organization: 'Deal Agency', email: 'deal-agency@example.test', role: 'agency', countryCode: 'IN' });
+  const dmc = await register(baseUrl, { name: 'Deal DMC', organization: 'Kyoto Deal DMC', email: 'deal-dmc@example.test', role: 'dmc', countryCode: 'JP', coverage: 'kyoto' });
+  const hotel = await register(baseUrl, { name: 'Deal Hotel', organization: 'Kyoto Deal Inn', email: 'deal-hotel@example.test', role: 'hotelier', countryCode: 'JP', propertyCity: 'Kyoto' });
+  await approveSellers(baseUrl, admin, [dmc, hotel]);
+  const draft = await api(baseUrl, '/v1/marketplace/requests', agency, { method: 'POST', body: requestInput() });
+  const requestId = draft.body.request.id;
+  await api(baseUrl, `/v1/marketplace/requests/${requestId}/publish`, agency, { method: 'POST', body: {} });
+  const validityUntil = new Date(Date.now() + 5 * 86400000).toISOString();
+  const landBody = { total_minor: 150000, option_label: '4 star', currency: 'INR', validity_until: validityUntil, line_items: [{ item_type: 'other', description: 'Complete land package', quantity: 1, unit_price_minor: 150000 }], options: [{ label: '5 star', total_minor: 260000 }] };
+  const landOffer = (await api(baseUrl, `/v1/marketplace/requests/${requestId}/offers`, dmc, { method: 'POST', body: landBody })).body.offer;
+  const roomOffer = (await api(baseUrl, `/v1/marketplace/requests/${requestId}/offers`, hotel, { method: 'POST', body: { rate_per_night_minor: 18000, room_type: 'Deluxe Twin', currency: 'INR', room_count: 1, validity_until: validityUntil } })).body.offer;
+  const negotiate = (account, offerId, body) => api(baseUrl, `/v1/marketplace/offers/${offerId}/negotiations`, account, { method: 'POST', body });
+  const answer = (account, negotiationId, verb, body = {}) => api(baseUrl, `/v1/marketplace/negotiations/${negotiationId}/${verb}`, account, { method: 'POST', body });
+
+  assert.match((await negotiate(agency, landOffer.id, { kind: 'revision_request' })).body.error.message, /what to change/);
+  assert.match((await negotiate(agency, landOffer.id, { kind: 'counter_offer' })).body.error.message, /counter price/);
+  assert.match((await negotiate(agency, landOffer.id, { kind: 'revision_request', message: 'Call 9876543210 to discuss' })).body.error.message, /contact details/);
+  assert.equal((await negotiate(dmc, landOffer.id, { kind: 'revision_request', message: 'Please add a guide.' })).response.status, 403);
+  const revisionRequest = await negotiate(agency, landOffer.id, { kind: 'revision_request', message: 'Please include a private guide on day two.' });
+  assert.equal(revisionRequest.response.status, 201);
+  assert.equal((await negotiate(agency, landOffer.id, { kind: 'counter_offer', counter_price_minor: 140000 })).body.error.code, 'NEGOTIATION_ALREADY_OPEN');
+  assert.ok((await api(baseUrl, '/v1/notifications', dmc)).body.notifications.some((item) => item.type === 'offer_revision_requested'));
+  assert.equal((await api(baseUrl, '/v1/marketplace/requests', dmc)).body.requests[0].openNegotiation.kind, 'revision_request');
+  assert.equal((await answer(dmc, revisionRequest.body.negotiation.id, 'accept')).body.error.code, 'NEGOTIATION_NOT_COUNTER');
+
+  assert.equal((await api(baseUrl, `/v1/marketplace/requests/${requestId}/close`, agency, { method: 'POST', body: {} })).body.status, 'closed');
+  const revise = () => api(baseUrl, `/v1/marketplace/offers/${landOffer.id}`, dmc, { method: 'PUT', body: { ...landBody, inclusions: ['guide'] } });
+  assert.equal((await revise()).response.status, 200);
+  assert.equal((await api(baseUrl, `/v1/marketplace/offers/${landOffer.id}/negotiations`, agency)).body.negotiations[0].status, 'revised');
+  assert.equal((await revise()).body.error.code, 'OFFER_NOT_EDITABLE');
+
+  const mainCounter = await negotiate(agency, landOffer.id, { kind: 'counter_offer', counter_price_minor: 140000, message: 'Client budget is tighter.' });
+  assert.equal((await answer(dmc, mainCounter.body.negotiation.id, 'accept')).body.error.code, 'COUNTER_NEEDS_REVISION');
+  assert.equal((await answer(dmc, mainCounter.body.negotiation.id, 'decline', { note: 'No' })).response.status, 400);
+  const declined = await answer(dmc, mainCounter.body.negotiation.id, 'decline', { note: 'Our hotel rates are already contracted.' });
+  assert.equal(declined.body.negotiation.status, 'declined');
+  assert.ok((await api(baseUrl, '/v1/notifications', agency)).body.notifications.some((item) => item.type === 'offer_negotiation_declined'));
+
+  const comparison = await api(baseUrl, `/v1/marketplace/requests/${requestId}/offers`, agency);
+  const fiveStarId = comparison.body.offers.find((offer) => offer.id === landOffer.id).options[0].id;
+  const optionCounter = await negotiate(agency, landOffer.id, { kind: 'counter_offer', counter_price_minor: 240000, offer_option_id: fiveStarId });
+  assert.equal(optionCounter.body.negotiation.optionLabel, '5 star');
+  assert.equal((await api(baseUrl, `/v1/marketplace/requests/${requestId}/offers`, agency)).body.offers.find((offer) => offer.id === landOffer.id).openNegotiation.counterPriceMinor, 240000);
+  assert.equal((await answer(hotel, optionCounter.body.negotiation.id, 'accept')).response.status, 404);
+  const acceptedOption = await answer(dmc, optionCounter.body.negotiation.id, 'accept');
+  assert.deepEqual([acceptedOption.body.offer.totalMinor, acceptedOption.body.offer.options[0].totalMinor, acceptedOption.body.offer.openNegotiation], [150000, 240000, null]);
+  assert.equal((await api(baseUrl, `/v1/marketplace/offers/${landOffer.id}/revisions`, dmc)).body.revisions[0].snapshot.options[0].totalMinor, 260000);
+  assert.ok((await api(baseUrl, '/v1/notifications', agency)).body.notifications.some((item) => item.type === 'offer_counter_accepted'));
+
+  const withdrawnCounter = await negotiate(agency, roomOffer.id, { kind: 'counter_offer', counter_price_minor: 16000 });
+  assert.equal((await api(baseUrl, `/v1/marketplace/negotiations/${withdrawnCounter.body.negotiation.id}/withdraw`, agency, { method: 'POST', body: {} })).body.negotiation.status, 'withdrawn');
+  assert.equal((await answer(hotel, withdrawnCounter.body.negotiation.id, 'accept')).body.error.code, 'NEGOTIATION_NOT_OPEN');
+  const roomCounter = await negotiate(agency, roomOffer.id, { kind: 'counter_offer', counter_price_minor: 16500 });
+  assert.equal((await answer(hotel, roomCounter.body.negotiation.id, 'accept')).body.offer.ratePerNightMinor, 16500);
+  assert.deepEqual((await api(baseUrl, `/v1/marketplace/offers/${roomOffer.id}/negotiations`, hotel)).body.negotiations.map((item) => item.status), ['accepted', 'withdrawn']);
+  assert.equal((await api(baseUrl, `/v1/marketplace/offers/${roomOffer.id}/negotiations`, dmc)).response.status, 404);
+
+  for (const price of [145000, 146000]) {
+    const round = await negotiate(agency, landOffer.id, { kind: 'counter_offer', counter_price_minor: price });
+    await api(baseUrl, `/v1/marketplace/negotiations/${round.body.negotiation.id}/withdraw`, agency, { method: 'POST', body: {} });
+  }
+  assert.equal((await negotiate(agency, landOffer.id, { kind: 'counter_offer', counter_price_minor: 147000 })).body.error.code, 'NEGOTIATION_LIMIT_REACHED');
+
+  const pending = await negotiate(agency, roomOffer.id, { kind: 'revision_request', message: 'Could you add breakfast?' });
+  assert.equal((await api(baseUrl, `/v1/marketplace/requests/${requestId}/award`, agency, { method: 'POST', body: { offer_id: landOffer.id, offer_option_id: fiveStarId } })).response.status, 201);
+  assert.equal((await api(baseUrl, `/v1/marketplace/offers/${roomOffer.id}/negotiations`, agency)).body.negotiations.find((item) => item.id === pending.body.negotiation.id).status, 'closed');
 });
 
 async function uploadVoucher(baseUrl, account, awardId, body, filename = 'voucher.pdf') {
@@ -1252,4 +1546,178 @@ test('booking confirmation releases sealed guest details only to the winning sel
   assert.equal((await api(baseUrl, guestPath, agency)).body.error.code, 'GUEST_DETAILS_DELETED');
   assert.equal((await api(baseUrl, `/v1/marketplace/awards/${awardId}`, agency)).body.award.guestDetailsReleased, false);
   assert.equal([...storage.objects.keys()].some((key) => key.includes(awardId)), false);
+});
+
+async function uploadAttachment(baseUrl, account, path, body, { filename = 'itinerary.pdf', fields = {} } = {}) {
+  const form = new FormData();
+  for (const [name, value] of Object.entries(fields)) form.append(name, value);
+  form.append('file', new Blob([body]), filename);
+  const response = await fetch(`${baseUrl}/v1/attachments${path}`, {
+    method: 'POST',
+    headers: { cookie: account.cookie, 'x-csrf-token': account.session.csrfToken },
+    body: form,
+  });
+  return { response, body: await response.json() };
+}
+
+test('offers and request messages carry scanned attachments that only the two parties can open', async (context) => {
+  const { pool, baseUrl, storage } = await startMarketplaceApp(context);
+  const admin = await register(baseUrl, { name: 'Files Admin', organization: 'Files Ops', email: 'files-admin@example.test', role: 'agency', countryCode: 'IN' });
+  await promoteTestAdmin(pool, admin);
+  const agency = await register(baseUrl, { name: 'Files Agent', organization: 'Files Agency', email: 'files-agency@example.test', role: 'agency', countryCode: 'IN' });
+  const dmc = await register(baseUrl, { name: 'Files DMC', organization: 'Kyoto Files DMC', email: 'files-dmc@example.test', role: 'dmc', countryCode: 'JP', coverage: 'kyoto' });
+  const rival = await register(baseUrl, { name: 'Rival DMC', organization: 'Kyoto Rival DMC', email: 'files-rival@example.test', role: 'dmc', countryCode: 'JP', coverage: 'kyoto' });
+  await approveSellers(baseUrl, admin, [dmc, rival]);
+  const draft = await api(baseUrl, '/v1/marketplace/requests', agency, { method: 'POST', body: requestInput() });
+  const requestId = draft.body.request.id;
+  await api(baseUrl, `/v1/marketplace/requests/${requestId}/publish`, agency, { method: 'POST', body: {} });
+  const offer = (await api(baseUrl, `/v1/marketplace/requests/${requestId}/offers`, dmc, { method: 'POST', body: { total_minor: 150000, currency: 'INR', validity_until: new Date(Date.now() + 5 * 86400000).toISOString() } })).body.offer;
+  const offerPath = `/offers/${offer.id}`;
+  const scan = () => processDocumentScans(pool, { storage, scanner: { scan: async () => ({ infected: false }) } });
+  const downloadUrl = (account, attachmentId) => api(baseUrl, `/v1/attachments/${attachmentId}/download-url`, account, { method: 'POST', body: {} });
+  const comparedAttachments = async () => (await api(baseUrl, `/v1/marketplace/requests/${requestId}/offers`, agency)).body.offers[0].attachments;
+
+  assert.equal((await uploadAttachment(baseUrl, agency, offerPath, pdfBytes())).response.status, 403);
+  assert.equal((await uploadAttachment(baseUrl, rival, offerPath, pdfBytes())).response.status, 404);
+  assert.equal((await uploadAttachment(baseUrl, dmc, offerPath, Buffer.from('plain text itinerary'), { filename: 'itinerary.txt' })).body.error.code, 'UNSUPPORTED_FILE_TYPE');
+  const itinerary = await uploadAttachment(baseUrl, dmc, offerPath, pdfBytes('itinerary'));
+  assert.deepEqual([itinerary.response.status, itinerary.body.attachment.scanStatus, itinerary.body.attachment.filename], [201, 'pending', 'itinerary.pdf']);
+  const renamed = await uploadAttachment(baseUrl, dmc, offerPath, pdfBytes('photos'), { filename: 'call 9876543210.pdf' });
+  assert.equal(renamed.body.attachment.filename, 'offer-attachment.pdf');
+  assert.equal((await comparedAttachments()).length, 2);
+  assert.equal((await downloadUrl(agency, itinerary.body.attachment.id)).body.error.code, 'DOCUMENT_NOT_SCANNED');
+  assert.deepEqual(await scan(), { clean: 2, infected: 0, retrying: 0, failed: 0 });
+  assert.match((await downloadUrl(agency, itinerary.body.attachment.id)).body.url, /disposition=attachment/);
+  assert.equal((await downloadUrl(rival, itinerary.body.attachment.id)).response.status, 404);
+
+  assert.equal((await api(baseUrl, `/v1/attachments/${renamed.body.attachment.id}`, agency, { method: 'DELETE', body: {} })).response.status, 404);
+  assert.equal((await api(baseUrl, `/v1/attachments/${renamed.body.attachment.id}`, dmc, { method: 'DELETE', body: {} })).response.status, 204);
+  assert.deepEqual((await comparedAttachments()).map((item) => item.filename), ['itinerary.pdf']);
+  assert.equal([...storage.objects.keys()].some((key) => key.includes(renamed.body.attachment.id)), false);
+
+  await pool.query("UPDATE marketplace_requests SET response_deadline = NOW() - INTERVAL '1 minute' WHERE id = $1", [requestId]);
+  assert.equal((await uploadAttachment(baseUrl, dmc, offerPath, pdfBytes('late'))).body.error.code, 'RESPONSE_DEADLINE_PASSED');
+  await api(baseUrl, `/v1/marketplace/offers/${offer.id}/negotiations`, agency, { method: 'POST', body: { kind: 'revision_request', message: 'Please attach the day-by-day plan.' } });
+  assert.equal((await uploadAttachment(baseUrl, dmc, offerPath, pdfBytes('day plan'))).response.status, 201);
+
+  const messagePath = `/requests/${requestId}/messages`;
+  assert.equal((await uploadAttachment(baseUrl, agency, messagePath, pdfBytes(), { fields: { seller_organization_id: dmc.session.organization.id, body: 'Mail me at someone@example.com' } })).response.status, 400);
+  const shared = await uploadAttachment(baseUrl, agency, messagePath, pdfBytes('brief'), { filename: 'client-brief.pdf', fields: { seller_organization_id: dmc.session.organization.id } });
+  assert.deepEqual([shared.response.status, shared.body.message.body, shared.body.message.attachments.length], [201, 'Shared a file: client-brief.pdf', 1]);
+  const sellerThread = await api(baseUrl, `/v1/marketplace/requests/${requestId}/messages`, dmc);
+  assert.equal(sellerThread.body.messages.at(-1).attachments[0].filename, 'client-brief.pdf');
+  assert.ok((await api(baseUrl, '/v1/notifications', dmc)).body.notifications.some((item) => item.type === 'request_message' && item.message.includes('New file')));
+
+  assert.equal((await api(baseUrl, `/v1/marketplace/requests/${requestId}/award`, agency, { method: 'POST', body: { offer_id: offer.id } })).response.status, 201);
+  const afterAward = await uploadAttachment(baseUrl, dmc, messagePath, pdfBytes('vouchers'), { filename: 'transfer-plan.pdf', fields: { body: 'Transfer plan for arrival day.' } });
+  assert.equal(afterAward.response.status, 201);
+  assert.equal((await uploadAttachment(baseUrl, rival, messagePath, pdfBytes('late'))).body.error.code, 'CONVERSATION_NOT_FOUND');
+  await scan();
+  assert.equal((await downloadUrl(agency, afterAward.body.message.attachments[0].id)).response.status, 200);
+  assert.equal((await downloadUrl(dmc, shared.body.message.attachments[0].id)).response.status, 200);
+  assert.equal((await downloadUrl(rival, shared.body.message.attachments[0].id)).response.status, 404);
+});
+
+test('booking parties request and answer amendments and cancellations with guest access revoked on cancellation', async (context) => {
+  const { pool, baseUrl } = await startMarketplaceApp(context);
+  const admin = await register(baseUrl, { name: 'Change Admin', organization: 'Change Ops', email: 'change-admin@example.test', role: 'agency', countryCode: 'IN' });
+  await promoteTestAdmin(pool, admin);
+  const agency = await register(baseUrl, { name: 'Change Agent', organization: 'Change Agency', email: 'change-agency@example.test', role: 'agency', countryCode: 'IN' });
+  const hotel = await register(baseUrl, { name: 'Change Hotel', organization: 'Kyoto Change Inn', email: 'change-hotel@example.test', role: 'hotelier', countryCode: 'JP', propertyCity: 'Kyoto' });
+  await approveSellers(baseUrl, admin, [hotel]);
+  const draft = await api(baseUrl, '/v1/marketplace/requests', agency, { method: 'POST', body: requestInput() });
+  const requestId = draft.body.request.id;
+  await api(baseUrl, `/v1/marketplace/requests/${requestId}/publish`, agency, { method: 'POST', body: {} });
+  const offer = await api(baseUrl, `/v1/marketplace/requests/${requestId}/offers`, hotel, { method: 'POST', body: { rate_per_night_minor: 18500, room_type: 'Garden Twin', currency: 'JPY', validity_until: new Date(Date.now() + 5 * 86400000).toISOString(), room_count: 1 } });
+  const awarded = await api(baseUrl, `/v1/marketplace/requests/${requestId}/award`, agency, { method: 'POST', body: { offer_id: offer.body.offer.id } });
+  const awardId = awarded.body.award.id;
+  const details = { guests: [{ full_name: 'Asha Rao', traveller_type: 'adult', nationality: 'IN', room_number: 1 }, { full_name: 'Vikram Rao', traveller_type: 'adult', nationality: 'IN', room_number: 1 }], lead_guest_index: 0, arrival_date: '2027-04-14', arrival_time: '14:30', departure_date: '2027-04-21' };
+  assert.equal((await api(baseUrl, `/v1/bookings/${awardId}/confirm`, agency, { method: 'POST', body: details })).response.status, 201);
+  assert.equal((await api(baseUrl, `/v1/bookings/${awardId}/seller-confirmation`, hotel, { method: 'POST', body: { confirmation_number: 'KY-48213' } })).body.booking.status, 'booked');
+  const changesPath = `/v1/bookings/${awardId}/changes`;
+  const propose = (account, body) => api(baseUrl, changesPath, account, { method: 'POST', body });
+  const respond = (account, changeId, action, body = {}) => api(baseUrl, `/v1/bookings/${awardId}/changes/${changeId}/${action}`, account, { method: 'POST', body });
+
+  assert.equal((await propose(agency, { change_type: 'amendment', message: 'Please change the dates.' })).body.error.code, 'VALIDATION_ERROR');
+  assert.equal((await propose(agency, { change_type: 'amendment', message: 'Please move the trip.', proposed_changes: { travel_start_date: '2027-04-15', travel_end_date: '2027-04-22', nights: 6 } })).body.error.code, 'VALIDATION_ERROR');
+  assert.equal((await propose(agency, { change_type: 'amendment', message: 'Call 9876543210 to discuss.', proposed_changes: { nights: 8 } })).body.error.code, 'VALIDATION_ERROR');
+  const amendment = await propose(agency, { change_type: 'amendment', message: 'Please move the arrival by one day.', proposed_changes: { travel_start_date: '2027-04-15', travel_end_date: '2027-04-22', nights: 7, room_count: 2 } });
+  assert.equal(amendment.response.status, 201);
+  assert.equal(amendment.body.change.isMine, true);
+  assert.equal((await propose(hotel, { change_type: 'cancellation', message: 'We need to cancel this stay.' })).body.error.code, 'CHANGE_ALREADY_PENDING');
+  assert.equal((await respond(agency, amendment.body.change.id, 'accept')).body.error.code, 'CHANGE_SELF_RESPONSE');
+  const accepted = await respond(hotel, amendment.body.change.id, 'accept');
+  assert.equal(accepted.body.change.status, 'accepted');
+  assert.deepEqual([accepted.body.booking.travelStartDate, accepted.body.booking.travelEndDate, accepted.body.booking.nights, accepted.body.booking.roomCount], ['2027-04-15', '2027-04-22', 7, 2]);
+  const amendedGuests = await api(baseUrl, `/v1/bookings/${awardId}/guest-details`, hotel);
+  assert.deepEqual([amendedGuests.body.guestDetails.arrival.date, amendedGuests.body.guestDetails.departure.date], ['2027-04-15', '2027-04-22']);
+  const agencyBooking = await api(baseUrl, `/v1/bookings/${awardId}`, agency);
+  assert.deepEqual(agencyBooking.body.booking.changes.map((change) => [change.type, change.status, change.proposedChanges.nights]), [['amendment', 'accepted', 7]]);
+  assert.ok((await api(baseUrl, '/v1/notifications', agency)).body.notifications.some((item) => item.type === 'booking_change_accepted'));
+
+  const sellerCancel = await propose(hotel, { change_type: 'cancellation', message: 'Property maintenance makes this stay unavailable.' });
+  assert.equal(sellerCancel.response.status, 201);
+  assert.equal((await respond(agency, sellerCancel.body.change.id, 'decline', { note: 'We can keep the original reservation.' })).body.change.status, 'declined');
+  const agencyCancel = await propose(agency, { change_type: 'cancellation', message: 'The travellers can no longer make the trip.' });
+  assert.equal(agencyCancel.response.status, 201);
+  const cancelled = await respond(hotel, agencyCancel.body.change.id, 'accept');
+  assert.deepEqual([cancelled.body.change.status, cancelled.body.booking.status, cancelled.body.booking.guestDetails.revokedReason], ['accepted', 'cancelled', 'Booking cancellation accepted']);
+  assert.equal((await api(baseUrl, `/v1/bookings/${awardId}/guest-details`, hotel)).body.error.code, 'GUEST_DETAILS_NOT_AVAILABLE');
+  assert.equal((await api(baseUrl, '/v1/bookings', agency)).body.bookings[0].status, 'cancelled');
+  assert.ok((await api(baseUrl, '/v1/notifications', agency)).body.notifications.some((item) => item.type === 'booking_cancelled'));
+  assert.equal((await propose(agency, { change_type: 'cancellation', message: 'Cancel again please.' })).body.error.code, 'BOOKING_NOT_CHANGEABLE');
+});
+
+test('agencies split an award across sellers and can undo it within the window before booking', async (context) => {
+  const { pool, baseUrl } = await startMarketplaceApp(context);
+  const admin = await register(baseUrl, { name: 'Split Admin', organization: 'Split Ops', email: 'split-admin@example.test', role: 'agency', countryCode: 'IN' });
+  await promoteTestAdmin(pool, admin);
+  const agency = await register(baseUrl, { name: 'Split Agent', organization: 'Split Agency', email: 'split-agency@example.test', role: 'agency', countryCode: 'IN' });
+  const dmc = await register(baseUrl, { name: 'Split DMC', organization: 'Kyoto Split DMC', email: 'split-dmc@example.test', role: 'dmc', countryCode: 'JP', coverage: 'kyoto' });
+  const hotel = await register(baseUrl, { name: 'Split Hotel', organization: 'Kyoto Split Inn', email: 'split-hotel@example.test', role: 'hotelier', countryCode: 'JP', propertyCity: 'Kyoto' });
+  const rival = await register(baseUrl, { name: 'Split Rival', organization: 'Kyoto Split Rival', email: 'split-rival@example.test', role: 'dmc', countryCode: 'JP', coverage: 'kyoto' });
+  await approveSellers(baseUrl, admin, [dmc, hotel, rival]);
+  const draft = await api(baseUrl, '/v1/marketplace/requests', agency, { method: 'POST', body: requestInput() });
+  const requestId = draft.body.request.id;
+  await api(baseUrl, `/v1/marketplace/requests/${requestId}/publish`, agency, { method: 'POST', body: {} });
+  const validityUntil = new Date(Date.now() + 5 * 86400000).toISOString();
+  const submit = async (account, body) => (await api(baseUrl, `/v1/marketplace/requests/${requestId}/offers`, account, { method: 'POST', body: { currency: 'INR', validity_until: validityUntil, ...body } })).body.offer;
+  const groundOffer = await submit(dmc, { total_minor: 90000 });
+  const roomOffer = await submit(hotel, { rate_per_night_minor: 8000, room_type: 'Deluxe Twin', room_count: 1 });
+  const rivalOffer = await submit(rival, { total_minor: 150000 });
+  const award = (body) => api(baseUrl, `/v1/marketplace/requests/${requestId}/award`, agency, { method: 'POST', body });
+  const undo = (account, body = {}) => api(baseUrl, `/v1/marketplace/requests/${requestId}/award/undo`, account, { method: 'POST', body });
+  const notices = async (account, type) => (await api(baseUrl, '/v1/notifications', account)).body.notifications.filter((item) => item.type === type);
+
+  assert.match((await award({ selections: [1, 2, 3, 4].map(() => ({ offer_id: randomUUID() })) })).body.error.message, /at most 3/);
+  assert.match((await award({ selections: [{ offer_id: groundOffer.id }, { offer_id: groundOffer.id }] })).body.error.message, /only once/);
+  assert.equal((await award({})).body.error.message, 'Choose an offer to award.');
+  const split = await award({ selections: [{ offer_id: groundOffer.id }, { offer_id: roomOffer.id }], not_selected_reason: 'Split between a DMC and the hotel.' });
+  assert.equal(split.response.status, 201);
+  assert.deepEqual(split.body.awards.map((item) => item.sellerOrganizationId).sort(), [dmc.session.organization.id, hotel.session.organization.id].sort());
+  assert.match((await notices(hotel, 'offer_awarded'))[0].message, /Shared award/);
+  assert.match((await notices(rival, 'offer_not_selected'))[0].message, /Split between/);
+  assert.deepEqual([(await api(baseUrl, '/v1/bookings', agency)).body.bookings.length, (await api(baseUrl, '/v1/bookings', hotel)).body.bookings.length], [2, 1]);
+  const awardedView = (await api(baseUrl, `/v1/marketplace/requests/${requestId}`, agency)).body.request;
+  assert.ok(awardedView.awardedAt && new Date(awardedView.awardUndoUntil) > new Date());
+  assert.equal((await api(baseUrl, '/v1/marketplace/requests', rival)).body.requests.length, 0);
+  assert.equal((await api(baseUrl, '/v1/marketplace/requests', hotel)).body.requests[0].status, 'awarded');
+
+  assert.equal((await undo(hotel)).response.status, 403);
+  assert.equal((await undo(agency, { reason: 'Call 9876543210' })).response.status, 400);
+  const undone = await undo(agency, { reason: 'Client changed hotel preference.' });
+  assert.deepEqual(undone.body, { requestId, status: 'open', restoredOffers: 3 });
+  assert.equal((await pool.query('SELECT COUNT(*)::int AS count FROM awards WHERE request_id = $1', [requestId])).rows[0].count, 0);
+  assert.equal((await pool.query('SELECT jsonb_array_length(awards) AS count FROM award_reversals WHERE request_id = $1', [requestId])).rows[0].count, 2);
+  assert.deepEqual((await pool.query('SELECT DISTINCT status FROM offers WHERE request_id = $1', [requestId])).rows, [{ status: 'submitted' }]);
+  assert.match((await notices(rival, 'award_undone'))[0].message, /Client changed hotel preference/);
+  assert.equal((await api(baseUrl, '/v1/marketplace/requests', rival)).body.requests[0].hasActiveOffer, true);
+  assert.equal((await undo(agency)).body.error.code, 'REQUEST_NOT_AWARDED');
+
+  const single = await award({ offer_id: rivalOffer.id });
+  assert.equal(single.response.status, 201);
+  await pool.query("UPDATE awards SET status = 'confirmation_pending' WHERE id = $1", [single.body.award.id]);
+  assert.equal((await undo(agency)).body.error.code, 'AWARD_IN_PROGRESS');
+  await pool.query("UPDATE awards SET status = 'awarded', created_at = NOW() - INTERVAL '20 minutes' WHERE id = $1", [single.body.award.id]);
+  assert.equal((await undo(agency)).body.error.code, 'UNDO_WINDOW_PASSED');
 });

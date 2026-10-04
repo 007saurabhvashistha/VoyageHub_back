@@ -8,9 +8,10 @@ import { createOrganizationRouter } from './routes/organization.routes.js';
 import { createReferenceDataRouter } from './routes/referenceData.routes.js';
 import { createAccountRouter } from './routes/account.routes.js';
 import { createLegalRouter } from './routes/legal.routes.js';
-import { createSellerDocumentsRouter } from './routes/sellerDocuments.routes.js';
+import { createVerificationDocumentsRouter } from './routes/verificationDocuments.routes.js';
 import { createBookingRouter } from './routes/booking.routes.js';
 import { createWebhookRouter } from './routes/webhook.routes.js';
+import { createAttachmentRouter } from './routes/attachment.routes.js';
 
 export function createApp({ pool = null, secureCookies = process.env.NODE_ENV === 'production', cookieName = process.env.SESSION_COOKIE_NAME ?? 'lead_exchange_session', emailDelivery = null, tokenEncryptionKey = null, mfaEncryptionKey = null, storage = null, guestDataEncryptionKey = null, webhookEncryptionKey = null, webhookAllowInsecureUrls = undefined } = {}) {
   const app = express();
@@ -49,8 +50,9 @@ export function createApp({ pool = null, secureCookies = process.env.NODE_ENV ==
   app.use('/v1/reference-data', createReferenceDataRouter({ pool, cookieName }));
   app.use('/v1/account', createAccountRouter({ pool, cookieName, secureCookies }));
   app.use('/v1/legal', createLegalRouter({ pool }));
-  app.use('/v1/seller-documents', createSellerDocumentsRouter({ pool, storage }));
+  app.use('/v1/verification-documents', createVerificationDocumentsRouter({ pool, storage }));
   app.use('/v1/bookings', createBookingRouter({ pool, storage, guestDataEncryptionKey }));
+  app.use('/v1/attachments', createAttachmentRouter({ pool, storage }));
   app.use('/v1/webhooks', createWebhookRouter({ pool, encryptionKey: webhookEncryptionKey, allowInsecureUrls: webhookAllowInsecureUrls }));
 
   app.use((_request, response) => {

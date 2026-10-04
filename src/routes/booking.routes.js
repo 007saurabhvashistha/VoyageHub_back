@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { config } from '../config/index.js';
 import { capabilities } from '../config/referenceData.js';
 import { guestAccessWindow, openGuestDetails, parseGuestDetails, sealGuestDetails } from '../services/bookingGuestDetails.js';
+import { bookingChangeResponseSchema, bookingChangeSchema, bookingChangeDto, loadBookingChanges } from '../services/bookingChanges.js';
 import { recordOrganizationEvent } from '../services/organizationAudit.js';
 import { organizationIsActive } from '../services/organizationLifecycle.js';
 import { requireCapability } from '../services/permissions.js';
@@ -37,10 +38,18 @@ const bookingSelect = `
   SELECT a.id, a.request_id, a.offer_id, a.status, a.created_at, a.booking_confirmed_at,
          a.seller_confirmation_number, a.seller_confirmation_note, a.seller_confirmed_at,
          a.agency_organization_id, a.seller_organization_id,
-         r.request_code, r.destination, r.destination_country, r.travel_start_date::text AS travel_start_date,
-         r.travel_end_date::text AS travel_end_date, r.travel_month, r.nights, r.adults, r.children, r.infants,
+         r.request_code, r.destination, r.destination_country,
+         COALESCE((SELECT c.proposed_changes->>'travel_start_date' FROM booking_change_requests c WHERE c.award_id = a.id AND c.status = 'accepted' AND c.change_type = 'amendment' AND c.proposed_changes ? 'travel_start_date' ORDER BY c.responded_at DESC LIMIT 1), r.travel_start_date::text) AS travel_start_date,
+         COALESCE((SELECT c.proposed_changes->>'travel_end_date' FROM booking_change_requests c WHERE c.award_id = a.id AND c.status = 'accepted' AND c.change_type = 'amendment' AND c.proposed_changes ? 'travel_end_date' ORDER BY c.responded_at DESC LIMIT 1), r.travel_end_date::text) AS travel_end_date,
+         r.travel_month,
+         COALESCE((SELECT (c.proposed_changes->>'nights')::int FROM booking_change_requests c WHERE c.award_id = a.id AND c.status = 'accepted' AND c.change_type = 'amendment' AND c.proposed_changes ? 'nights' ORDER BY c.responded_at DESC LIMIT 1), r.nights) AS nights,
+         r.adults, r.children, r.infants,
+         COALESCE((SELECT (c.proposed_changes->>'room_count')::int FROM booking_change_requests c WHERE c.award_id = a.id AND c.status = 'accepted' AND c.change_type = 'amendment' AND c.proposed_changes ? 'room_count' ORDER BY c.responded_at DESC LIMIT 1), f.room_count, r.room_count) AS effective_room_count,
          r.room_count AS request_room_count,
-         f.offer_kind, f.room_type, f.room_count AS offer_room_count, f.meal_plan, f.currency, f.total_minor, f.rate_per_night_minor,
+         f.offer_kind, COALESCE(opt.room_type, f.room_type) AS room_type, f.room_count AS offer_room_count,
+         COALESCE(opt.meal_plan, f.meal_plan) AS meal_plan, f.currency,
+         COALESCE(opt.total_minor, f.total_minor) AS total_minor, COALESCE(opt.rate_per_night_minor, f.rate_per_night_minor) AS rate_per_night_minor,
+         a.offer_option_id, COALESCE(opt.label, f.option_label) AS option_label, COALESCE(opt.hotel_category, f.hotel_category) AS hotel_category,
          agency.name AS agency_name, seller.name AS seller_name, seller.business_type AS seller_type,
          (${organizationIsActive('seller')}) AS seller_active,
          g.award_id IS NOT NULL AS has_guest_details, g.guest_count, g.trip_end_date::text AS trip_end_date,
@@ -49,6 +58,7 @@ const bookingSelect = `
   FROM awards a
   JOIN marketplace_requests r ON r.id = a.request_id
   JOIN offers f ON f.id = a.offer_id
+  LEFT JOIN offer_options opt ON opt.id = a.offer_option_id
   JOIN organizations agency ON agency.id = a.agency_organization_id
   JOIN organizations seller ON seller.id = a.seller_organization_id
   LEFT JOIN booking_guest_details g ON g.award_id = a.id`;
@@ -110,7 +120,7 @@ function bookingFacts(row) {
     travelEndDate: row.travel_end_date,
     travelMonth: row.travel_month,
     nights: row.nights,
-    roomCount: Number(row.offer_room_count ?? row.request_room_count ?? 1),
+    roomCount: Number(row.effective_room_count ?? row.offer_room_count ?? row.request_room_count ?? 1),
     roomingRequired: row.offer_kind === 'hotel_room',
   };
 }
@@ -127,7 +137,7 @@ function sellerAccessError(row, settings) {
 
 function bookingDto(row, organizationId, settings) {
   const window = row.has_guest_details ? guestAccessWindow(row.trip_end_date, settings) : null;
-  const roomCount = Number(row.offer_room_count ?? row.request_room_count ?? 1);
+  const roomCount = Number(row.effective_room_count ?? row.offer_room_count ?? row.request_room_count ?? 1);
   return {
     id: row.id,
     requestId: row.request_id,
@@ -149,6 +159,9 @@ function bookingDto(row, organizationId, settings) {
     sellerType: row.seller_type,
     offer: {
       id: row.offer_id,
+      optionId: row.offer_option_id ?? null,
+      optionLabel: row.option_label ?? null,
+      hotelCategory: row.hotel_category ?? null,
       kind: row.offer_kind,
       roomType: row.room_type,
       mealPlan: row.meal_plan,
@@ -215,7 +228,8 @@ export function createBookingRouter({ pool, storage = null, guestDataEncryptionK
     const row = await loadBooking(pool, awardId, organizationId);
     const settings = await guestDataSettings(pool);
     const vouchers = await pool.query('SELECT * FROM booking_vouchers WHERE award_id = $1 ORDER BY created_at DESC', [awardId]);
-    return { ...bookingDto(row, organizationId, settings), vouchers: vouchers.rows.map(voucherDto) };
+    const changes = await loadBookingChanges(pool, [awardId], organizationId);
+    return { ...bookingDto(row, organizationId, settings), vouchers: vouchers.rows.map(voucherDto), changes: changes.get(awardId) ?? [] };
   }
 
   router.get('/', async (request, response, next) => {
@@ -225,7 +239,8 @@ export function createBookingRouter({ pool, storage = null, guestDataEncryptionK
         `${bookingSelect} WHERE a.agency_organization_id = $1 OR a.seller_organization_id = $1 ORDER BY a.created_at DESC LIMIT 200`,
         [request.auth.organization_id],
       );
-      return response.json({ bookings: result.rows.map((row) => bookingDto(row, request.auth.organization_id, settings)) });
+      const changes = await loadBookingChanges(pool, result.rows.map((row) => row.id), request.auth.organization_id);
+      return response.json({ bookings: result.rows.map((row) => ({ ...bookingDto(row, request.auth.organization_id, settings), changes: changes.get(row.id) ?? [] })) });
     } catch (error) {
       return next(error);
     }
@@ -239,6 +254,140 @@ export function createBookingRouter({ pool, storage = null, guestDataEncryptionK
       return next(error);
     }
   });
+
+  router.post('/:awardId/changes', requireCapability(capabilities.bookingManage), async (request, response, next) => {
+    const input = parseWith(bookingChangeSchema, request.body ?? {});
+    if (input.error) return fail(response, 400, 'VALIDATION_ERROR', input.error);
+    const { awardId } = request.params;
+    const me = request.auth.organization_id;
+    try {
+      const outcome = await inTransaction(pool, async (client) => {
+        const booking = await loadBooking(client, awardId, me, { lock: true });
+        if (!booking) return { error: [404, 'BOOKING_NOT_FOUND', 'Booking was not found.'] };
+        if (!confirmedStatuses.includes(booking.status)) return { error: [409, 'BOOKING_NOT_CHANGEABLE', 'Only confirmed bookings can be changed or cancelled.'] };
+        const pending = await client.query("SELECT 1 FROM booking_change_requests WHERE award_id = $1 AND status = 'pending'", [awardId]);
+        if (pending.rowCount) return { error: [409, 'CHANGE_ALREADY_PENDING', 'Wait for the other party to answer the current booking request.'] };
+        const change = input.data;
+        const created = await client.query(
+          `INSERT INTO booking_change_requests (id, award_id, initiated_by_organization_id, initiated_by_user_id, change_type, proposed_changes, message)
+           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+          [randomUUID(), awardId, me, request.auth.user_id, change.change_type, JSON.stringify(change.proposed_changes), change.message],
+        );
+        const recipient = booking.agency_organization_id === me ? booking.seller_organization_id : booking.agency_organization_id;
+        const cancellation = change.change_type === 'cancellation';
+        const eventType = cancellation ? 'booking_cancellation_requested' : 'booking_change_requested';
+        await notify(client, recipient, eventType, cancellation ? 'Booking cancellation requested' : 'Booking change requested', `${booking.request_code} / ${change.message}`, { awardId, requestId: booking.request_id, requestCode: booking.request_code, changeId: created.rows[0].id });
+        await recordOrganizationEvent(client, { organizationId: me, actorUserId: request.auth.user_id, action: cancellation ? 'booking.cancellation_requested' : 'booking.change_requested', details: { awardId, changeId: created.rows[0].id } });
+        return { change: bookingChangeDto(created.rows[0], me) };
+      });
+      if (outcome.error) return fail(response, ...outcome.error);
+      return response.status(201).json({ change: outcome.change });
+    } catch (error) {
+      if (error.code === '23505') return fail(response, 409, 'CHANGE_ALREADY_PENDING', 'Wait for the other party to answer the current booking request.');
+      return next(error);
+    }
+  });
+
+  router.post('/:awardId/changes/:changeId/withdraw', requireCapability(capabilities.bookingManage), async (request, response, next) => {
+    const { awardId, changeId } = request.params;
+    const me = request.auth.organization_id;
+    if (!uuidSchema.safeParse(changeId).success) return fail(response, 404, 'CHANGE_NOT_FOUND', 'Booking change was not found.');
+    try {
+      const outcome = await inTransaction(pool, async (client) => {
+        const result = await client.query(
+          `UPDATE booking_change_requests c SET status = 'withdrawn', responded_by_user_id = $3, responded_at = NOW()
+           FROM awards a WHERE c.id = $1 AND c.award_id = $2 AND c.award_id = a.id
+             AND c.initiated_by_organization_id = $4 AND c.status = 'pending'
+             AND (a.agency_organization_id = $4 OR a.seller_organization_id = $4)
+           RETURNING c.*`,
+          [changeId, awardId, request.auth.user_id, me],
+        );
+        if (!result.rowCount) return { error: [404, 'CHANGE_NOT_FOUND', 'This pending change request was not found.'] };
+        return { change: bookingChangeDto(result.rows[0], me) };
+      });
+      if (outcome.error) return fail(response, ...outcome.error);
+      return response.json({ change: outcome.change });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  const respondToBookingChange = (accept) => async (request, response, next) => {
+    const { awardId, changeId } = request.params;
+    const me = request.auth.organization_id;
+    if (!uuidSchema.safeParse(changeId).success) return fail(response, 404, 'CHANGE_NOT_FOUND', 'Booking change was not found.');
+    const input = accept ? { data: { note: null } } : parseWith(bookingChangeResponseSchema, request.body ?? {});
+    if (input.error) return fail(response, 400, 'VALIDATION_ERROR', input.error);
+    try {
+      const outcome = await inTransaction(pool, async (client) => {
+        const result = await client.query(
+            `SELECT c.*, a.request_id, r.request_code, r.destination, a.status AS booking_status,
+                  a.agency_organization_id, a.seller_organization_id
+             FROM booking_change_requests c JOIN awards a ON a.id = c.award_id
+             JOIN marketplace_requests r ON r.id = a.request_id
+           WHERE c.id = $1 AND c.award_id = $2 AND c.status = 'pending'
+             AND (a.agency_organization_id = $3 OR a.seller_organization_id = $3)
+           FOR UPDATE OF c, a`,
+          [changeId, awardId, me],
+        );
+        const change = result.rows[0];
+        if (!change) return { error: [404, 'CHANGE_NOT_FOUND', 'This pending change request was not found.'] };
+        const sender = change.initiated_by_organization_id;
+        if (sender === me) return { error: [403, 'CHANGE_SELF_RESPONSE', 'The other party must answer your request.'] };
+        if (!confirmedStatuses.includes(change.booking_status)) return { error: [409, 'BOOKING_NOT_CHANGEABLE', 'This booking is no longer changeable.'] };
+        if (accept && change.change_type === 'amendment') {
+          const sealed = await client.query('SELECT ciphertext, version FROM booking_guest_details WHERE award_id = $1 AND purged_at IS NULL', [awardId]);
+          if (sealed.rowCount) {
+            if (!guestDataEncryptionKey) return { error: [503, 'GUEST_DATA_ENCRYPTION_NOT_CONFIGURED', 'Guest details cannot be amended until guest-data encryption is configured.'] };
+            const guestDetails = openGuestDetails(awardId, sealed.rows[0].ciphertext, guestDataEncryptionKey);
+            const proposedRooms = change.proposed_changes.room_count;
+            if (proposedRooms != null && guestDetails.guests.some((guest) => guest.roomNumber != null && guest.roomNumber > proposedRooms)) {
+              return { error: [409, 'GUEST_ROOM_ASSIGNMENTS_INVALID', 'Correct the guest room assignments before accepting a lower room count.'] };
+            }
+            if (change.proposed_changes.travel_start_date) guestDetails.arrival.date = change.proposed_changes.travel_start_date;
+            if (change.proposed_changes.travel_end_date) guestDetails.departure.date = change.proposed_changes.travel_end_date;
+            const tripEndDate = change.proposed_changes.travel_end_date ?? guestDetails.departure.date;
+            const updatedGuests = await client.query(
+              `UPDATE booking_guest_details SET ciphertext = $2, trip_end_date = $3, version = version + 1,
+                 updated_by = $4, updated_at = NOW() WHERE award_id = $1 AND purged_at IS NULL RETURNING version`,
+              [awardId, sealGuestDetails(awardId, guestDetails, guestDataEncryptionKey), tripEndDate, request.auth.user_id],
+            );
+            if (change.proposed_changes.travel_end_date) await logAccess(client, { awardId, organizationId: me, userId: request.auth.user_id, action: 'corrected', details: { version: updatedGuests.rows[0].version, changeId, reason: 'Accepted booking amendment' } });
+          }
+        }
+        const status = accept ? 'accepted' : 'declined';
+        const note = accept ? null : input.data.note;
+        const updated = await client.query(
+          'UPDATE booking_change_requests SET status = $2, response_note = $3, responded_by_user_id = $4, responded_at = NOW() WHERE id = $1 RETURNING *',
+          [changeId, status, note, request.auth.user_id],
+        );
+        const cancellation = change.change_type === 'cancellation';
+        if (accept && cancellation) {
+          await client.query("UPDATE awards SET status = 'cancelled' WHERE id = $1", [awardId]);
+          const revoked = await client.query(
+            `UPDATE booking_guest_details SET revoked_at = COALESCE(revoked_at, NOW()),
+               revoked_reason = 'Booking cancellation accepted', updated_at = NOW()
+             WHERE award_id = $1 AND purged_at IS NULL RETURNING award_id`,
+            [awardId],
+          );
+          if (revoked.rowCount) await logAccess(client, { awardId, organizationId: me, userId: request.auth.user_id, action: 'revoked', details: { reason: 'Booking cancellation accepted', changeId } });
+        }
+        const eventType = accept ? cancellation ? 'booking_cancelled' : 'booking_change_accepted' : 'booking_change_declined';
+        const title = accept ? cancellation ? 'Booking cancelled' : 'Booking change accepted' : 'Booking change declined';
+        const summary = `${change.request_code} / ${change.destination} / ${note ? `Response: ${note}` : cancellation ? 'Cancellation accepted.' : 'The proposed amendment was accepted.'}`;
+        await notify(client, sender, eventType, title, summary, { awardId, requestId: change.request_id, requestCode: change.request_code, changeId });
+        await recordOrganizationEvent(client, { organizationId: me, actorUserId: request.auth.user_id, action: accept ? cancellation ? 'booking.cancelled' : 'booking.change_accepted' : 'booking.change_declined', details: { awardId, changeId } });
+        return { change: bookingChangeDto(updated.rows[0], me) };
+      });
+      if (outcome.error) return fail(response, ...outcome.error);
+      return response.json({ change: outcome.change, ...(accept ? { booking: await bookingResponse(awardId, me) } : {}) });
+    } catch (error) {
+      return next(error);
+    }
+  };
+
+  router.post('/:awardId/changes/:changeId/accept', requireCapability(capabilities.bookingManage), respondToBookingChange(true));
+  router.post('/:awardId/changes/:changeId/decline', requireCapability(capabilities.bookingManage), respondToBookingChange(false));
 
   router.post('/:awardId/confirm', requireCapability(capabilities.requestAward), requireGuestKey, async (request, response, next) => {
     if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the agency that awarded the offer can confirm the booking.');

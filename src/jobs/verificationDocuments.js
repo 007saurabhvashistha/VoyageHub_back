@@ -45,6 +45,12 @@ const scanSources = [
     data: (row) => ({ voucherId: row.id, awardId: row.award_id }),
     onClean: (client, row) => notify(client, row.agency_organization_id, 'booking_voucher_ready', 'Booking voucher available', `${row.original_filename} passed the malware scan and can be opened.`, { voucherId: row.id, awardId: row.award_id }),
   },
+  {
+    table: 'marketplace_attachments',
+    ownerId: (row) => row.owner_organization_id,
+    label: (row) => `Attachment ${row.original_filename}`,
+    data: (row) => ({ attachmentId: row.id, requestId: row.request_id, offerId: row.offer_id, messageId: row.message_id }),
+  },
 ];
 
 async function finishScan(pool, source, document, { status, result, deleteFile, current, notice }) {
@@ -141,24 +147,30 @@ export async function processDocumentRetention(pool, { storage, now = () => new 
   const rejectedDays = await getSetting(pool, 'rejected_document_retention_days');
   const closedDays = await getSetting(pool, 'closed_organization_document_retention_days');
   const due = await pool.query(
-    `SELECT d.id, d.storage_key, d.storage_provider FROM organization_documents d
+    `SELECT 'organization_documents' AS source, d.id, d.storage_key, d.storage_provider, d.created_at FROM organization_documents d
      JOIN organizations o ON o.id = d.organization_id
      LEFT JOIN seller_profiles p ON p.organization_id = o.id
+     LEFT JOIN agency_verifications agency ON agency.organization_id = o.id
      WHERE d.deleted_at IS NULL AND (
        (o.closed_at IS NOT NULL AND o.closed_at <= $1)
        OR (o.closed_at IS NULL AND p.verification_status = 'rejected' AND (
          SELECT MAX(review.created_at) FROM seller_verification_reviews review
          WHERE review.seller_organization_id = o.id AND review.decision = 'rejected'
        ) <= $2)
+       OR (o.closed_at IS NULL AND agency.status = 'rejected' AND agency.decided_at <= $2)
      )
-     ORDER BY d.created_at LIMIT $3`,
+     UNION ALL
+     SELECT 'marketplace_attachments', a.id, a.storage_key, a.storage_provider, a.created_at FROM marketplace_attachments a
+     JOIN organizations o ON o.id = a.owner_organization_id
+     WHERE a.deleted_at IS NULL AND o.closed_at IS NOT NULL AND o.closed_at <= $1
+     ORDER BY created_at LIMIT $3`,
     [new Date(current.getTime() - closedDays * dayMs), new Date(current.getTime() - rejectedDays * dayMs), retentionBatchSize],
   );
   for (const document of due.rows) {
     try {
       if (document.storage_provider !== storage.provider) throw new Error('Document is held by a storage provider that is not configured.');
       await storage.deleteObject(document.storage_key);
-      await pool.query('UPDATE organization_documents SET deleted_at = $2 WHERE id = $1 AND deleted_at IS NULL', [document.id, current]);
+      await pool.query(`UPDATE ${document.source} SET deleted_at = $2 WHERE id = $1 AND deleted_at IS NULL`, [document.id, current]);
       summary.deletedDocuments += 1;
     } catch {
       summary.failures += 1;

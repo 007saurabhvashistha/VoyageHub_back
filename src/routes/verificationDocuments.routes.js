@@ -5,7 +5,7 @@ import { config } from '../config/index.js';
 import { capabilities } from '../config/referenceData.js';
 import { requireCapability } from '../services/permissions.js';
 import { recordOrganizationEvent } from '../services/organizationAudit.js';
-import { detectAllowedFileType, displayFilename, documentDto, documentRequirementsFor, sha256Hex, verificationDocumentStatus } from '../services/verificationDocuments.js';
+import { agencyVerificationDto, detectAllowedFileType, displayFilename, documentDto, documentRequirementsFor, lockAgencyVerification, requirementLabels, sha256Hex, verificationDocumentStatus, verificationStateFor } from '../services/verificationDocuments.js';
 import { createRateLimiter } from '../utils/rateLimit.js';
 import { loadSession, requireActiveAccount, requireCsrf, requireMfaForPlatformAdmin } from './auth.routes.js';
 
@@ -20,7 +20,7 @@ const multerErrors = {
   LIMIT_UNEXPECTED_FILE: [400, 'VALIDATION_ERROR', 'Send the document in the "file" field.'],
 };
 
-export function createSellerDocumentsRouter({ pool, storage }) {
+export function createVerificationDocumentsRouter({ pool, storage }) {
   const router = Router();
   const uploadLimiter = createRateLimiter(config.rateLimits.documentUpload, 'Too many document uploads. Try again later.');
   const upload = multer({
@@ -32,20 +32,51 @@ export function createSellerDocumentsRouter({ pool, storage }) {
   router.use((request, response, next) => loadSession(pool, request, response, next));
   router.use(requireMfaForPlatformAdmin);
   router.use((request, response, next) => requireActiveAccount(pool, request, response, next));
-  router.use((request, response, next) => ['dmc', 'hotelier'].includes(request.auth.business_type)
+  router.use((request, response, next) => documentRequirementsFor(request.auth.business_type, request.auth.country_code).length
     ? next()
-    : fail(response, 403, 'ROLE_FORBIDDEN', 'Verification documents are only used for DMC and hotel seller accounts.'));
+    : fail(response, 403, 'ROLE_FORBIDDEN', 'Verification documents are not used for this account type.'));
 
   router.get('/', async (request, response, next) => {
     try {
-      const status = await verificationDocumentStatus(pool, {
-        organizationId: request.auth.organization_id,
-        businessType: request.auth.business_type,
-        countryCode: request.auth.country_code,
-      });
-      return response.json({ storageConfigured: Boolean(storage), ...status });
+      const scope = { organizationId: request.auth.organization_id, businessType: request.auth.business_type, countryCode: request.auth.country_code };
+      const [status, verification] = await Promise.all([verificationDocumentStatus(pool, scope), verificationStateFor(pool, scope)]);
+      return response.json({ storageConfigured: Boolean(storage), ...status, verification });
     } catch (error) {
       return next(error);
+    }
+  });
+
+  router.post('/submit', requireCsrf, requireCapability(capabilities.profileManage), async (request, response, next) => {
+    if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Seller profiles are queued for review automatically.');
+    const organizationId = request.auth.organization_id;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const verification = await lockAgencyVerification(client, organizationId);
+      if (verification.status === 'pending' || verification.status === 'approved') {
+        await client.query('ROLLBACK');
+        return verification.status === 'pending'
+          ? fail(response, 409, 'VERIFICATION_ALREADY_SUBMITTED', 'Your documents are already waiting for review.')
+          : fail(response, 409, 'AGENCY_ALREADY_VERIFIED', 'Your agency is already verified.');
+      }
+      const status = await verificationDocumentStatus(client, { organizationId, businessType: 'agency', countryCode: request.auth.country_code });
+      if (status.notUploaded.length) {
+        await client.query('ROLLBACK');
+        return fail(response, 409, 'DOCUMENTS_INCOMPLETE', `Upload every required document before submitting. Missing: ${requirementLabels(status, status.notUploaded).join('; ')}.`);
+      }
+      const updated = await client.query(
+        `UPDATE agency_verifications SET status = 'pending', submitted_at = NOW(), updated_at = NOW()
+         WHERE organization_id = $1 RETURNING *`,
+        [organizationId],
+      );
+      await recordOrganizationEvent(client, { organizationId, actorUserId: request.auth.user_id, action: 'verification.submitted', details: {} });
+      await client.query('COMMIT');
+      return response.json({ verification: agencyVerificationDto(updated.rows[0]) });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      return next(error);
+    } finally {
+      client.release();
     }
   });
 
@@ -81,11 +112,30 @@ export function createSellerDocumentsRouter({ pool, storage }) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      const profile = await client.query('SELECT verification_status FROM seller_profiles WHERE organization_id = $1 FOR UPDATE', [organizationId]);
-      if (!profile.rowCount) {
-        await client.query('ROLLBACK');
-        await storage.deleteObject(storageKey).catch(() => {});
-        return fail(response, 404, 'PROFILE_NOT_FOUND', 'Seller profile was not found.');
+      let verificationStatus;
+      if (request.auth.business_type === 'agency') {
+        verificationStatus = (await lockAgencyVerification(client, organizationId)).status;
+        // A rejected agency resubmits explicitly once its replacement files are in place.
+        if (verificationStatus === 'rejected') {
+          await client.query("UPDATE agency_verifications SET status = 'unsubmitted', updated_at = NOW() WHERE organization_id = $1", [organizationId]);
+          verificationStatus = 'unsubmitted';
+        }
+      } else {
+        const profile = await client.query('SELECT verification_status FROM seller_profiles WHERE organization_id = $1 FOR UPDATE', [organizationId]);
+        if (!profile.rowCount) {
+          await client.query('ROLLBACK');
+          await storage.deleteObject(storageKey).catch(() => {});
+          return fail(response, 404, 'PROFILE_NOT_FOUND', 'Seller profile was not found.');
+        }
+        verificationStatus = profile.rows[0].verification_status;
+        if (verificationStatus === 'rejected') {
+          await client.query(
+            `UPDATE seller_profiles SET verification_status = 'pending', verification_reason = 'Documents updated and awaiting review.', updated_at = NOW()
+             WHERE organization_id = $1`,
+            [organizationId],
+          );
+          verificationStatus = 'pending';
+        }
       }
       await client.query(
         `UPDATE organization_documents SET superseded_at = NOW()
@@ -97,15 +147,6 @@ export function createSellerDocumentsRouter({ pool, storage }) {
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
         [documentId, organizationId, documentType, storage.provider, storageKey, filename, detected.mime, request.file.size, sha256Hex(request.file.buffer), request.auth.user_id],
       );
-      let verificationStatus = profile.rows[0].verification_status;
-      if (verificationStatus === 'rejected') {
-        await client.query(
-          `UPDATE seller_profiles SET verification_status = 'pending', verification_reason = 'Documents updated and awaiting review.', updated_at = NOW()
-           WHERE organization_id = $1`,
-          [organizationId],
-        );
-        verificationStatus = 'pending';
-      }
       await recordOrganizationEvent(client, { organizationId, actorUserId: request.auth.user_id, action: 'document.uploaded', details: { documentId, documentType } });
       await client.query('COMMIT');
       return response.status(201).json({ document: documentDto(inserted.rows[0]), verificationStatus });

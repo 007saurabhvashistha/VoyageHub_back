@@ -78,12 +78,22 @@ async function buildExport(pool, auth) {
 
   // Organization records are business data; only owners and managers may export them.
   if (capabilitiesFor(auth.access_role).includes(capabilities.profileManage)) {
-    const [requests, offers, lineItems, awards, sellerProfile, coverage, inventory, documents] = await Promise.all([
+    const [requests, offers, lineItems, options, attachments, awards, sellerProfile, coverage, inventory, documents] = await Promise.all([
       pool.query('SELECT * FROM marketplace_requests WHERE agency_organization_id = $1 ORDER BY created_at', [organizationId]),
       pool.query('SELECT f.*, r.request_code FROM offers f JOIN marketplace_requests r ON r.id = f.request_id WHERE f.seller_organization_id = $1 ORDER BY f.created_at', [organizationId]),
       pool.query(
         `SELECT li.* FROM offer_line_items li JOIN offers f ON f.id = li.offer_id
          WHERE f.seller_organization_id = $1 ORDER BY li.offer_id, li.position`,
+        [organizationId],
+      ),
+      pool.query(
+        `SELECT o.* FROM offer_options o JOIN offers f ON f.id = o.offer_id
+         WHERE f.seller_organization_id = $1 ORDER BY o.offer_id, o.position`,
+        [organizationId],
+      ),
+      pool.query(
+        `SELECT offer_id, message_id, original_filename, content_type, size_bytes, scan_status, created_at, deleted_at
+         FROM marketplace_attachments WHERE owner_organization_id = $1 ORDER BY created_at`,
         [organizationId],
       ),
       pool.query('SELECT * FROM awards WHERE agency_organization_id = $1 OR seller_organization_id = $1 ORDER BY created_at', [organizationId]),
@@ -102,6 +112,8 @@ async function buildExport(pool, auth) {
     ]);
     const itemsByOffer = new Map();
     for (const item of lineItems.rows) itemsByOffer.set(item.offer_id, [...(itemsByOffer.get(item.offer_id) ?? []), item]);
+    const optionsByOffer = new Map();
+    for (const option of options.rows) optionsByOffer.set(option.offer_id, [...(optionsByOffer.get(option.offer_id) ?? []), option]);
     data.organization = {
       id: organizationId,
       name: auth.organization_name,
@@ -110,8 +122,9 @@ async function buildExport(pool, auth) {
       sellerProfile: sellerProfile.rows[0] ?? null,
       coverage: coverage.rows,
       requests: requests.rows,
-      offers: offers.rows.map((row) => ({ ...row, line_items: itemsByOffer.get(row.id) ?? [] })),
+      offers: offers.rows.map((row) => ({ ...row, line_items: itemsByOffer.get(row.id) ?? [], options: optionsByOffer.get(row.id) ?? [] })),
       awards: awards.rows,
+      attachments: attachments.rows,
       hotelInventory: inventory.rows,
       verificationDocuments: documents.rows,
     };

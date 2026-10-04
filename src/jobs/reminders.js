@@ -33,11 +33,14 @@ export async function processReminders(pool, {
     for (const request of closingSoon.rows) {
       if (!(await claimReminder(client, `deadline:${request.id}:${new Date(request.response_deadline).toISOString()}`))) continue;
       const data = { requestId: request.id, requestCode: request.request_code, responseDeadline: request.response_deadline };
+      // Sellers whose offer still awaits re-confirmation for changed trip details are reminded too.
       const waitingSellers = await client.query(
         `SELECT t.seller_organization_id FROM request_targets t
+         JOIN marketplace_requests r ON r.id = t.request_id
          WHERE t.request_id = $1 AND t.declined_at IS NULL
            AND NOT EXISTS (SELECT 1 FROM offers f WHERE f.request_id = t.request_id
-             AND f.seller_organization_id = t.seller_organization_id AND f.status IN ('submitted', 'shortlisted', 'accepted'))`,
+             AND f.seller_organization_id = t.seller_organization_id AND f.status IN ('submitted', 'shortlisted', 'accepted')
+             AND f.confirmed_trip_version >= r.trip_version)`,
         [request.id],
       );
       for (const seller of waitingSellers.rows) {

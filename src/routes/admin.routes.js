@@ -9,7 +9,9 @@ import { registerDestinationAdminRoutes } from './adminDestinations.routes.js';
 import { registerLegalAdminRoutes } from './adminLegal.routes.js';
 import { registerDocumentAdminRoutes } from './adminDocuments.routes.js';
 import { registerOperationsAdminRoutes } from './adminOperations.routes.js';
-import { verificationDocumentStatus } from '../services/verificationDocuments.js';
+import { registerAgencyVerificationAdminRoutes } from './adminAgencyVerification.routes.js';
+import { verificationDecisionSchema, verificationDocumentStatus } from '../services/verificationDocuments.js';
+import { parseWith } from '../utils/validation.js';
 
 function fail(response, status, code, message) {
   return response.status(status).json({ error: { code, message } });
@@ -29,6 +31,7 @@ export function createAdminRouter({ pool, storage = null }) {
   registerDestinationAdminRoutes(router, pool);
   registerDocumentAdminRoutes(router, pool, storage);
   registerOperationsAdminRoutes(router, pool);
+  registerAgencyVerificationAdminRoutes(router, pool);
 
   router.get('/settings', async (_request, response, next) => {
     try {
@@ -133,10 +136,9 @@ export function createAdminRouter({ pool, storage = null }) {
   });
 
   router.post('/seller-profiles/:organizationId/decision', requireCsrf, async (request, response, next) => {
-    const decision = request.body?.decision;
-    const reason = typeof request.body?.reason === 'string' ? request.body.reason.trim() : '';
-    if (!['approved', 'rejected'].includes(decision)) return fail(response, 400, 'VALIDATION_ERROR', 'Decision must be approved or rejected.');
-    if (reason.length < 5 || reason.length > 500) return fail(response, 400, 'VALIDATION_ERROR', 'Provide a review reason between 5 and 500 characters.');
+    const input = parseWith(verificationDecisionSchema, request.body);
+    if (input.error) return fail(response, 400, 'VALIDATION_ERROR', input.error);
+    const { decision, reason } = input.data;
 
     const client = await pool.connect();
     try {

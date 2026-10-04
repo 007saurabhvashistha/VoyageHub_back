@@ -11,20 +11,16 @@ function fail(response, status, code, message) {
 }
 
 export function registerDocumentAdminRoutes(router, pool, storage) {
-  router.get('/seller-profiles/:organizationId/documents', async (request, response, next) => {
-    if (!uuidSchema.safeParse(request.params.organizationId).success) return fail(response, 400, 'VALIDATION_ERROR', 'Choose a valid seller organization.');
+  router.get('/organizations/:organizationId/documents', async (request, response, next) => {
+    if (!uuidSchema.safeParse(request.params.organizationId).success) return fail(response, 400, 'VALIDATION_ERROR', 'Choose a valid organization.');
     try {
-      const organization = await pool.query(
-        `SELECT o.id, o.business_type, o.country_code FROM organizations o
-         JOIN seller_profiles p ON p.organization_id = o.id WHERE o.id = $1`,
-        [request.params.organizationId],
-      );
-      if (!organization.rowCount) return fail(response, 404, 'SELLER_NOT_FOUND', 'Seller organization was not found.');
-      const seller = organization.rows[0];
-      const status = await verificationDocumentStatus(pool, { organizationId: seller.id, businessType: seller.business_type, countryCode: seller.country_code });
+      const organization = await pool.query('SELECT id, business_type, country_code FROM organizations WHERE id = $1', [request.params.organizationId]);
+      if (!organization.rowCount) return fail(response, 404, 'ORGANIZATION_NOT_FOUND', 'Organization was not found.');
+      const owner = organization.rows[0];
+      const status = await verificationDocumentStatus(pool, { organizationId: owner.id, businessType: owner.business_type, countryCode: owner.country_code });
       const history = await pool.query(
         'SELECT * FROM organization_documents WHERE organization_id = $1 ORDER BY created_at DESC LIMIT 100',
-        [seller.id],
+        [owner.id],
       );
       return response.json({ storageConfigured: Boolean(storage), ...status, history: history.rows.map(documentDto) });
     } catch (error) {
