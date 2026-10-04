@@ -11,18 +11,36 @@
     "start": "node src/server.js",
     "test": "node --test",
     "db:migrate": "node scripts/migrate.js",
+    "db:backup": "node scripts/backup-database.js",
+    "db:restore-drill": "node scripts/restore-drill.js",
     "admin:promote": "node scripts/promote-admin.js",
     "admin:demote": "node scripts/demote-admin.js",
-    "account:verify": "node scripts/verify-account.js"
+    "account:verify": "node scripts/verify-account.js",
+    "destinations:import": "node scripts/import-destinations.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1146.0",
+    "@aws-sdk/s3-request-presigner": "^3.1146.0",
+    "@azure/storage-blob": "^12.34.0",
     "@electric-sql/pglite": "^0.5.8",
     "bcryptjs": "^3.0.2",
+    "clamscan": "^2.4.0",
+    "content-disposition": "^3.0.0",
     "cookie-parser": "^1.4.7",
     "dotenv": "^16.4.7",
     "express": "^5.1.0",
     "express-rate-limit": "^7.5.0",
+    "fflate": "^0.8.3",
+    "file-type": "^22.1.1",
+    "i18n-iso-countries": "^7.14.0",
+    "multer": "^2.4.0",
     "otplib": "^13.5.0",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "request-filtering-agent": "^3.2.1",
+    "standardwebhooks": "^1.1.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite-tools": "^0.4.8"
   }
 }

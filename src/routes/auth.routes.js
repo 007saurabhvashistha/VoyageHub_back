@@ -1,13 +1,22 @@
 import { randomBytes, randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
-import rateLimit from 'express-rate-limit';
+import { z } from 'zod';
+import { config, isCountryCode } from '../config/index.js';
+import { createRateLimiter } from '../utils/rateLimit.js';
+import { businessTypes, capabilities } from '../config/referenceData.js';
+import { capabilitiesFor, requireCapability } from '../services/permissions.js';
+import { recordOrganizationEvent } from '../services/organizationAudit.js';
+import { parseWith } from '../utils/validation.js';
 import { encryptEmailActionToken, hashEmailActionToken } from '../utils/emailActionTokens.js';
 import { decryptSecret, encryptSecret } from '../utils/encryption.js';
 import { createRecoveryCodes, createTotpEnrollment, decryptTotpSecret, hashRecoveryCode, hashTotpCode, normalizeRecoveryCode, verifyTotpCode } from '../services/totp.js';
+import { loadCoverage, replaceCoverage, resolveActiveDestinations, sellerProfileResponse } from '../services/destinations.js';
+import { legalDocumentDto, missingAcceptances, pendingLegalDocuments, recordAcceptances } from '../services/legal.js';
 
-const allowedBusinessTypes = new Set(['agency', 'dmc', 'hotelier']);
-const sessionLifetimeMs = 14 * 24 * 60 * 60 * 1000;
+const allowedBusinessTypes = new Set(businessTypes.map((type) => type.value));
+const sessionLifetimeMs = config.sessionLifetimeMs;
+const mfaChallengeTtlMs = config.mfaChallengeTtlMs;
 const passwordWorkFactor = 12;
 const emailVerificationLifetimeMs = 24 * 60 * 60 * 1000;
 const passwordResetLifetimeMs = 15 * 60 * 1000;
@@ -43,7 +52,7 @@ function createMfaChallengeCookie(response, token, cookieName, secureCookies) {
     secure: secureCookies,
     sameSite: 'strict',
     path: '/',
-    maxAge: 5 * 60 * 1000,
+    maxAge: mfaChallengeTtlMs,
   });
 }
 
@@ -57,7 +66,7 @@ async function createMfaChallenge(client, response, userId, organizationId, cook
   await client.query(
     `INSERT INTO mfa_login_challenges (id, user_id, organization_id, token_hash, csrf_token, expires_at)
      VALUES ($1, $2, $3, $4, $5, $6)`,
-    [randomUUID(), userId, organizationId, hashToken(token), csrfToken, new Date(Date.now() + 5 * 60 * 1000)],
+    [randomUUID(), userId, organizationId, hashToken(token), csrfToken, new Date(Date.now() + mfaChallengeTtlMs)],
   );
   createMfaChallengeCookie(response, token, cookieName, secureCookies);
   return csrfToken;
@@ -136,8 +145,8 @@ export async function loadSession(pool, request, response, next) {
   try {
     const result = await pool.query(
             `SELECT s.id AS session_id, s.token_hash, s.csrf_token, u.id AS user_id, u.is_platform_admin, u.email_verified_at,
-              u.full_name, u.email, o.id AS organization_id, o.name AS organization_name,
-              o.business_type, o.country_code, m.access_role, COALESCE(mfa.enabled, FALSE) AS mfa_enabled
+              u.full_name, u.email, u.deletion_requested_at, u.deletion_scheduled_for, o.id AS organization_id, o.name AS organization_name,
+              o.business_type, o.country_code, o.suspended_at, o.closure_scheduled_for, o.verified_at, m.access_role, COALESCE(mfa.enabled, FALSE) AS mfa_enabled
        FROM auth_sessions s
        JOIN users u ON u.id = s.user_id
        JOIN organization_memberships m ON m.user_id = s.user_id AND m.organization_id = s.organization_id
@@ -151,6 +160,10 @@ export async function loadSession(pool, request, response, next) {
     if (!result.rows[0].email_verified_at) {
       await pool.query('DELETE FROM auth_sessions WHERE token_hash = $1', [result.rows[0].token_hash]);
       return apiError(response, 403, 'EMAIL_NOT_VERIFIED', 'Verify your email address before signing in.');
+    }
+    if (result.rows[0].suspended_at) {
+      await pool.query('DELETE FROM auth_sessions WHERE token_hash = $1', [result.rows[0].token_hash]);
+      return apiError(response, 403, 'ORGANIZATION_SUSPENDED', 'This organization is suspended. Contact platform support.');
     }
     request.auth = result.rows[0];
     request.sessionTokenHash = result.rows[0].token_hash;
@@ -174,52 +187,58 @@ export function requireCsrf(request, response, next) {
   return next();
 }
 
+// Blocks marketplace use while account deletion is pending or current legal terms are not accepted.
+export async function requireActiveAccount(pool, request, response, next) {
+  if (request.auth.deletion_requested_at) return apiError(response, 403, 'ACCOUNT_DELETION_PENDING', 'This account is scheduled for deletion. Cancel the deletion to continue.');
+  try {
+    const pending = await pendingLegalDocuments(pool, request.auth.user_id, request.auth.access_role);
+    if (pending.length) return apiError(response, 403, 'LEGAL_ACCEPTANCE_REQUIRED', `Review and accept: ${pending.map((row) => row.title).join(', ')}.`);
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+}
+
+const destinationIdSchema = z.uuid('Choose a destination from the destination list.');
+const registrationExtrasSchema = z.object({
+  coverage_destination_ids: z.array(destinationIdSchema).max(config.maxCoverageDestinations, `Choose up to ${config.maxCoverageDestinations} destinations.`).default([]).transform((ids) => [...new Set(ids)]),
+  property_destination_id: destinationIdSchema.nullish(),
+  accepted_legal_document_ids: z.array(z.uuid()).max(20).default([]),
+});
+
 function validRegistration(body) {
   const fullName = typeof body.full_name === 'string' ? body.full_name.trim() : '';
   const organizationName = typeof body.organization_name === 'string' ? body.organization_name.trim() : '';
   const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
   const countryCode = typeof body.country_code === 'string' ? body.country_code.trim().toUpperCase() : '';
   const businessType = typeof body.business_type === 'string' ? body.business_type : '';
-  const rawCoverage = typeof body.coverage_destinations === 'string' ? body.coverage_destinations.split(',') : [];
-  const coverageDestinations = rawCoverage.map((destination) => destination.trim().toLowerCase()).filter(Boolean);
-  const propertyCity = typeof body.property_city === 'string' ? body.property_city.trim() : '';
   const password = typeof body.password === 'string' ? body.password : '';
 
   if (fullName.length < 2 || fullName.length > 120) return { error: 'Enter a name between 2 and 120 characters.' };
   if (organizationName.length < 2 || organizationName.length > 160) return { error: 'Enter a business name between 2 and 160 characters.' };
   if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { error: 'Enter a valid business email address.' };
-  if (!/^[A-Z]{2}$/.test(countryCode)) return { error: 'Choose a valid country or region.' };
+  if (!isCountryCode(countryCode)) return { error: 'Choose a valid country or region.' };
   if (!allowedBusinessTypes.has(businessType)) return { error: 'Choose a supported business type.' };
-  if (businessType === 'dmc' && (coverageDestinations.length === 0 || coverageDestinations.length > 20 || coverageDestinations.some((destination) => destination.length > 100))) return { error: 'Add between 1 and 20 destination areas your DMC serves.' };
-  if (businessType === 'hotelier' && (propertyCity.length < 2 || propertyCity.length > 120)) return { error: 'Enter the city where your property is located.' };
+  const extras = parseWith(registrationExtrasSchema, body);
+  if (extras.error) return { error: extras.error };
+  const { coverage_destination_ids: coverageDestinationIds, property_destination_id: propertyDestinationId, accepted_legal_document_ids: acceptedLegalDocumentIds } = extras.data;
+  if (businessType === 'dmc' && coverageDestinationIds.length === 0) return { error: `Add between 1 and ${config.maxCoverageDestinations} destinations your DMC serves.` };
+  if (businessType === 'hotelier' && !propertyDestinationId) return { error: 'Choose the city where your property is located.' };
   if (password.length < 8 || Buffer.byteLength(password, 'utf8') > 72) return { error: 'Password must be at least 8 characters and no more than 72 bytes.' };
 
-  return { fullName, organizationName, email, countryCode, businessType, password, coverageDestinations, propertyCity };
+  return {
+    fullName, organizationName, email, countryCode, businessType, password, acceptedLegalDocumentIds,
+    coverageDestinationIds: businessType === 'dmc' ? coverageDestinationIds : [],
+    propertyDestinationId: businessType === 'hotelier' ? propertyDestinationId : null,
+  };
 }
 
 export function createAuthRouter({ pool, secureCookies, cookieName, emailDelivery = null, tokenEncryptionKey = null, mfaEncryptionKey = null }) {
   const router = Router();
-  const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    limit: 10,
-    standardHeaders: 'draft-7',
-    legacyHeaders: false,
-    message: { error: { code: 'RATE_LIMITED', message: 'Too many attempts. Try again later.' } },
-  });
-  const emailActionLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000,
-    limit: 5,
-    standardHeaders: 'draft-7',
-    legacyHeaders: false,
-    message: { error: { code: 'RATE_LIMITED', message: 'Too many email security requests. Try again later.' } },
-  });
-  const mfaLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    limit: 10,
-    standardHeaders: 'draft-7',
-    legacyHeaders: false,
-    message: { error: { code: 'RATE_LIMITED', message: 'Too many MFA attempts. Try again later.' } },
-  });
+  const authLimiter = createRateLimiter(config.rateLimits.auth, 'Too many attempts. Try again later.');
+  const loginLimiter = createRateLimiter(config.rateLimits.auth, 'Too many failed sign-in attempts. Try again later.', { skipSuccessfulRequests: true });
+  const emailActionLimiter = createRateLimiter(config.rateLimits.emailAction, 'Too many email security requests. Try again later.');
+  const mfaLimiter = createRateLimiter(config.rateLimits.mfa, 'Too many MFA attempts. Try again later.');
 
   router.post('/register', authLimiter, async (request, response, next) => {
     const input = validRegistration(request.body ?? {});
@@ -229,6 +248,12 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
 
     const client = await pool.connect();
     try {
+      const missing = await missingAcceptances(client, input.acceptedLegalDocumentIds, 'owner');
+      if (missing.length) return apiError(response, 400, 'LEGAL_ACCEPTANCE_REQUIRED', `Accept the current ${missing.map((row) => row.title).join(', ')} to create an account.`);
+      const coverage = await resolveActiveDestinations(client, input.coverageDestinationIds);
+      if (coverage.error) return apiError(response, 400, 'VALIDATION_ERROR', coverage.error);
+      const property = await resolveActiveDestinations(client, input.propertyDestinationId ? [input.propertyDestinationId] : [], { kinds: ['city'] });
+      if (property.error) return apiError(response, 400, 'VALIDATION_ERROR', property.error);
       const passwordHash = await bcrypt.hash(input.password, passwordWorkFactor);
       const organizationId = randomUUID();
       const userId = randomUUID();
@@ -247,10 +272,12 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
       );
       if (input.businessType !== 'agency') {
         await client.query(
-          'INSERT INTO seller_profiles (organization_id, coverage_destinations, property_city) VALUES ($1, $2, $3)',
-          [organizationId, input.coverageDestinations, input.businessType === 'hotelier' ? input.propertyCity : null],
+          'INSERT INTO seller_profiles (organization_id, property_destination_id) VALUES ($1, $2)',
+          [organizationId, input.propertyDestinationId],
         );
+        await replaceCoverage(client, organizationId, input.coverageDestinationIds);
       }
+      await recordAcceptances(client, { userId, organizationId, documentIds: input.acceptedLegalDocumentIds });
       await queueEmailAction(client, { userId, organizationId, purpose: 'verify_email', tokenEncryptionKey });
       await client.query('COMMIT');
       return response.status(201).json({
@@ -268,7 +295,7 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
     }
   });
 
-  router.post('/login', authLimiter, async (request, response, next) => {
+  router.post('/login', loginLimiter, async (request, response, next) => {
     const email = typeof request.body?.email === 'string' ? request.body.email.trim().toLowerCase() : '';
     const password = typeof request.body?.password === 'string' ? request.body.password : '';
     const businessType = typeof request.body?.business_type === 'string' ? request.body.business_type : '';
@@ -281,7 +308,7 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
         `SELECT u.id AS user_id, u.full_name, u.email, u.password_hash, u.is_platform_admin, u.email_verified_at,
           COALESCE(mfa.enabled, FALSE) AS mfa_enabled,
                 o.id AS organization_id, o.name AS organization_name,
-                o.business_type, o.country_code
+                o.business_type, o.country_code, o.suspended_at
          FROM users u
          JOIN organization_memberships m ON m.user_id = u.id
          JOIN organizations o ON o.id = m.organization_id
@@ -295,6 +322,7 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
         return apiError(response, 401, 'INVALID_CREDENTIALS', 'Email, password or business type is incorrect.');
       }
       if (!user.email_verified_at) return apiError(response, 403, 'EMAIL_NOT_VERIFIED', 'Verify your email address before signing in.');
+      if (user.suspended_at) return apiError(response, 403, 'ORGANIZATION_SUSPENDED', 'This organization is suspended. Contact platform support.');
 
       if (user.mfa_enabled) {
         if (!mfaEncryptionKey) return apiError(response, 503, 'MFA_NOT_CONFIGURED', 'MFA verification is unavailable until its encryption key is configured.');
@@ -645,12 +673,98 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
     }
   });
 
-  router.get('/me', (request, response, next) => loadSession(pool, request, response, next), (request, response) => {
+  router.get('/me', (request, response, next) => loadSession(pool, request, response, next), async (request, response, next) => {
     const { user_id, full_name, email, organization_id, organization_name, business_type, country_code, access_role, is_platform_admin, mfa_enabled } = request.auth;
-    response.json({
-      user: { id: user_id, fullName: full_name, email, isPlatformAdmin: is_platform_admin, mfaEnabled: Boolean(mfa_enabled) },
-      organization: { id: organization_id, name: organization_name, businessType: business_type, countryCode: country_code, accessRole: access_role },
-    });
+    try {
+      const pending = await pendingLegalDocuments(pool, user_id, access_role);
+      return response.json({
+        user: { id: user_id, fullName: full_name, email, isPlatformAdmin: is_platform_admin, mfaEnabled: Boolean(mfa_enabled) },
+        organization: { id: organization_id, name: organization_name, businessType: business_type, countryCode: country_code, accessRole: access_role },
+        capabilities: capabilitiesFor(access_role),
+        account: {
+          deletionRequestedAt: request.auth.deletion_requested_at ?? null,
+          deletionScheduledFor: request.auth.deletion_scheduled_for ?? null,
+          organizationClosureScheduledFor: request.auth.closure_scheduled_for ?? null,
+        },
+        pendingLegalDocuments: pending.map((row) => legalDocumentDto(row)),
+      });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  const invitationTokenSchema = z.string().min(20).max(200);
+  const invitationAcceptSchema = z.object({
+    token: invitationTokenSchema,
+    full_name: z.string().trim().min(2, 'Enter a name between 2 and 120 characters.').max(120, 'Enter a name between 2 and 120 characters.'),
+    password: z.string().min(8, 'Password must be at least 8 characters.').refine((value) => Buffer.byteLength(value, 'utf8') <= 72, 'Password must be no more than 72 bytes.'),
+    accepted_legal_document_ids: z.array(z.uuid()).max(20).default([]),
+  });
+
+  async function findPendingInvitation(db, token, lock = false) {
+    const result = await db.query(
+      `SELECT i.id, i.organization_id, i.email, i.access_role, i.expires_at, o.name AS organization_name, o.business_type
+       FROM organization_invitations i JOIN organizations o ON o.id = i.organization_id
+       WHERE i.token_hash = $1 AND i.accepted_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > NOW()
+       ${lock ? 'FOR UPDATE OF i' : ''}`,
+      [hashEmailActionToken(token)],
+    );
+    return result.rows[0] ?? null;
+  }
+
+  router.get('/invitations/preview', authLimiter, async (request, response, next) => {
+    const token = invitationTokenSchema.safeParse(request.query.token);
+    if (!token.success) return apiError(response, 400, 'VALIDATION_ERROR', 'This invitation link is incomplete.');
+    if (!pool) return apiError(response, 503, 'DATABASE_NOT_CONFIGURED', 'Account service is unavailable until the database is configured.');
+    try {
+      const invitation = await findPendingInvitation(pool, token.data);
+      if (!invitation) return apiError(response, 404, 'INVITATION_NOT_FOUND', 'This invitation is invalid, expired, revoked or already used.');
+      return response.json({ invitation: { organizationName: invitation.organization_name, businessType: invitation.business_type, email: invitation.email, role: invitation.access_role, expiresAt: invitation.expires_at } });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.post('/invitations/accept', authLimiter, async (request, response, next) => {
+    const input = parseWith(invitationAcceptSchema, request.body);
+    if (input.error) return apiError(response, 400, 'VALIDATION_ERROR', input.error);
+    if (!pool) return apiError(response, 503, 'DATABASE_NOT_CONFIGURED', 'Account service is unavailable until the database is configured.');
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const invitation = await findPendingInvitation(client, input.data.token, true);
+      if (!invitation) {
+        await client.query('ROLLBACK');
+        return apiError(response, 404, 'INVITATION_NOT_FOUND', 'This invitation is invalid, expired, revoked or already used.');
+      }
+      const missing = await missingAcceptances(client, input.data.accepted_legal_document_ids, invitation.access_role);
+      if (missing.length) {
+        await client.query('ROLLBACK');
+        return apiError(response, 400, 'LEGAL_ACCEPTANCE_REQUIRED', `Accept the current ${missing.map((row) => row.title).join(', ')} to join.`);
+      }
+      const userId = randomUUID();
+      const passwordHash = await bcrypt.hash(input.data.password, passwordWorkFactor);
+      // The single-use token was issued for this address by a verified organization manager.
+      await client.query(
+        'INSERT INTO users (id, full_name, email, password_hash, email_verified_at) VALUES ($1, $2, $3, $4, NOW())',
+        [userId, input.data.full_name, invitation.email, passwordHash],
+      );
+      await client.query(
+        'INSERT INTO organization_memberships (id, organization_id, user_id, access_role) VALUES ($1, $2, $3, $4)',
+        [randomUUID(), invitation.organization_id, userId, invitation.access_role],
+      );
+      await client.query('UPDATE organization_invitations SET accepted_at = NOW(), accepted_user_id = $2 WHERE id = $1', [invitation.id, userId]);
+      await recordAcceptances(client, { userId, organizationId: invitation.organization_id, documentIds: input.data.accepted_legal_document_ids });
+      await recordOrganizationEvent(client, { organizationId: invitation.organization_id, actorUserId: userId, action: 'invitation.accepted', targetUserId: userId, details: { email: invitation.email, role: invitation.access_role } });
+      await client.query('COMMIT');
+      return response.status(201).json({ email: invitation.email, organizationName: invitation.organization_name, businessType: invitation.business_type, role: invitation.access_role });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      if (error.code === '23505') return apiError(response, 409, 'EMAIL_IN_USE', 'An account already uses this email. Sign in instead.');
+      return next(error);
+    } finally {
+      client.release();
+    }
   });
 
   router.get('/csrf', (request, response, next) => loadSession(pool, request, response, next), (request, response) => {
@@ -670,45 +784,60 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
   router.get('/profile', (request, response, next) => loadSession(pool, request, response, next), async (request, response, next) => {
     if (request.auth.business_type === 'agency') return apiError(response, 403, 'ROLE_FORBIDDEN', 'Seller profiles are only available to DMCs and hoteliers.');
     try {
-      const result = await pool.query(
-        'SELECT coverage_destinations, property_city, verification_status, verification_reason FROM seller_profiles WHERE organization_id = $1',
-        [request.auth.organization_id],
-      );
-      if (!result.rowCount) return apiError(response, 404, 'PROFILE_NOT_FOUND', 'Seller profile was not found.');
-      const profile = result.rows[0];
-      return response.json({ coverageDestinations: profile.coverage_destinations, propertyCity: profile.property_city, verificationStatus: profile.verification_status, verificationReason: profile.verification_reason });
+      const profile = await sellerProfileResponse(pool, request.auth.organization_id);
+      if (!profile) return apiError(response, 404, 'PROFILE_NOT_FOUND', 'Seller profile was not found.');
+      return response.json(profile);
     } catch (error) {
       return next(error);
     }
   });
 
-  router.put('/profile', (request, response, next) => loadSession(pool, request, response, next), requireCsrf, async (request, response, next) => {
+  const profileSchema = z.object({
+    coverage_destination_ids: registrationExtrasSchema.shape.coverage_destination_ids,
+    property_destination_id: destinationIdSchema.nullish(),
+  });
+
+  router.put('/profile', (request, response, next) => loadSession(pool, request, response, next), requireCsrf, (request, response, next) => requireActiveAccount(pool, request, response, next), requireCapability(capabilities.profileManage), async (request, response, next) => {
     if (request.auth.business_type === 'agency') return apiError(response, 403, 'ROLE_FORBIDDEN', 'Seller profiles are only available to DMCs and hoteliers.');
-    const coverageDestinations = Array.isArray(request.body?.coverage_destinations)
-      ? [...new Set(request.body.coverage_destinations.map((destination) => typeof destination === 'string' ? destination.trim().toLowerCase() : ''))]
-      : [];
-    const propertyCity = typeof request.body?.property_city === 'string' ? request.body.property_city.trim() : '';
-    if (coverageDestinations.length > 20 || coverageDestinations.some((destination) => destination.length < 2 || destination.length > 100)) return apiError(response, 400, 'VALIDATION_ERROR', 'Coverage must contain up to 20 destination names of 2 to 100 characters.');
-    if (request.auth.business_type === 'dmc' && coverageDestinations.length === 0) return apiError(response, 400, 'VALIDATION_ERROR', 'Add at least one destination to your coverage.');
-    if (request.auth.business_type === 'hotelier' && (propertyCity.length < 2 || propertyCity.length > 120)) return apiError(response, 400, 'VALIDATION_ERROR', 'Enter a property city between 2 and 120 characters.');
-    const updatedProfile = { coverageDestinations, propertyCity: request.auth.business_type === 'hotelier' ? propertyCity : null };
+    const input = parseWith(profileSchema, request.body);
+    if (input.error) return apiError(response, 400, 'VALIDATION_ERROR', input.error);
+    const isDmc = request.auth.business_type === 'dmc';
+    const coverageIds = isDmc ? input.data.coverage_destination_ids : [];
+    const propertyDestinationId = isDmc ? null : input.data.property_destination_id ?? null;
+    if (isDmc && coverageIds.length === 0) return apiError(response, 400, 'VALIDATION_ERROR', 'Add at least one destination to your coverage.');
+    if (!isDmc && !propertyDestinationId) return apiError(response, 400, 'VALIDATION_ERROR', 'Choose the city where your property is located.');
     const client = await pool.connect();
     try {
+      const coverage = await resolveActiveDestinations(client, coverageIds);
+      if (coverage.error) return apiError(response, 400, 'VALIDATION_ERROR', coverage.error);
+      const property = await resolveActiveDestinations(client, propertyDestinationId ? [propertyDestinationId] : [], { kinds: ['city'] });
+      if (property.error) return apiError(response, 400, 'VALIDATION_ERROR', property.error);
       await client.query('BEGIN');
       const current = await client.query(
-        'SELECT coverage_destinations, property_city, verification_status, verification_reason FROM seller_profiles WHERE organization_id = $1 FOR UPDATE',
+        'SELECT property_destination_id, verification_status FROM seller_profiles WHERE organization_id = $1 FOR UPDATE',
         [request.auth.organization_id],
       );
       if (!current.rowCount) {
         await client.query('ROLLBACK');
         return apiError(response, 404, 'PROFILE_NOT_FOUND', 'Seller profile was not found.');
       }
-      const previousProfile = { coverageDestinations: current.rows[0].coverage_destinations, propertyCity: current.rows[0].property_city };
-      const changed = JSON.stringify(previousProfile.coverageDestinations) !== JSON.stringify(updatedProfile.coverageDestinations)
-        || previousProfile.propertyCity !== updatedProfile.propertyCity;
+      const previousCoverage = await loadCoverage(client, request.auth.organization_id);
+      const previousProfile = {
+        coverageDestinationIds: previousCoverage.map((row) => row.id).sort(),
+        coverageDestinations: previousCoverage.map((row) => row.name),
+        propertyDestinationId: current.rows[0].property_destination_id,
+      };
+      const updatedProfile = {
+        coverageDestinationIds: [...coverageIds].sort(),
+        coverageDestinations: coverage.rows.map((row) => row.name),
+        propertyDestinationId,
+        propertyCity: property.rows[0]?.name ?? null,
+      };
+      const changed = JSON.stringify(previousProfile.coverageDestinationIds) !== JSON.stringify(updatedProfile.coverageDestinationIds)
+        || previousProfile.propertyDestinationId !== updatedProfile.propertyDestinationId;
       if (!changed) {
         await client.query('COMMIT');
-        return response.json({ ...previousProfile, verificationStatus: current.rows[0].verification_status, verificationReason: current.rows[0].verification_reason, changed: false });
+        return response.json({ ...(await sellerProfileResponse(client, request.auth.organization_id)), changed: false });
       }
 
       await client.query(
@@ -717,11 +846,12 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
         [randomUUID(), request.auth.organization_id, request.auth.user_id, JSON.stringify(previousProfile), JSON.stringify(updatedProfile)],
       );
       await client.query(
-        `UPDATE seller_profiles SET coverage_destinations = $2, property_city = $3,
+        `UPDATE seller_profiles SET property_destination_id = $2, property_city = $3,
            verification_status = 'pending', verification_reason = 'Seller profile changed and requires a new review.', updated_at = NOW()
          WHERE organization_id = $1`,
-        [request.auth.organization_id, updatedProfile.coverageDestinations, updatedProfile.propertyCity],
+        [request.auth.organization_id, updatedProfile.propertyDestinationId, updatedProfile.propertyCity],
       );
+      await replaceCoverage(client, request.auth.organization_id, coverageIds);
       const withdrawn = await client.query(
         `UPDATE offers offer SET status = 'withdrawn', updated_at = NOW()
          FROM marketplace_requests request WHERE offer.request_id = request.id
@@ -744,7 +874,7 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
         [request.auth.organization_id],
       );
       await client.query('COMMIT');
-      return response.json({ ...updatedProfile, verificationStatus: 'pending', verificationReason: 'Seller profile changed and requires a new review.', changed: true });
+      return response.json({ ...(await sellerProfileResponse(client, request.auth.organization_id)), changed: true });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       return next(error);

@@ -1,52 +1,55 @@
 import { randomUUID } from 'node:crypto';
 import { Router } from 'express';
-import { loadSession, requireCsrf, requireMfaForPlatformAdmin } from './auth.routes.js';
-import { getMaxOffersPerRequest, maxOffersPerRequestBounds } from '../services/platformSettings.js';
+import { loadSession, requireActiveAccount, requireCsrf, requireMfaForPlatformAdmin } from './auth.routes.js';
+import { listSettings, platformSettingDefinitions, settingSchema, updateSetting } from '../services/platformSettings.js';
+import { sellerMatchesRequestDestination } from '../services/destinations.js';
+import { organizationIsActive } from '../services/organizationLifecycle.js';
+import { registerModerationRoutes } from './moderation.routes.js';
+import { registerDestinationAdminRoutes } from './adminDestinations.routes.js';
+import { registerLegalAdminRoutes } from './adminLegal.routes.js';
+import { registerDocumentAdminRoutes } from './adminDocuments.routes.js';
+import { registerOperationsAdminRoutes } from './adminOperations.routes.js';
+import { verificationDocumentStatus } from '../services/verificationDocuments.js';
 
 function fail(response, status, code, message) {
   return response.status(status).json({ error: { code, message } });
 }
 
-export function createAdminRouter({ pool }) {
+export function createAdminRouter({ pool, storage = null }) {
   const router = Router();
   router.use((request, response, next) => loadSession(pool, request, response, next));
   router.use((request, response, next) => request.auth.is_platform_admin
     ? next()
     : fail(response, 403, 'ADMIN_REQUIRED', 'Platform administrator access is required.'));
   router.use(requireMfaForPlatformAdmin);
+  // Registered before the legal-acceptance guard so an admin can publish every document in one session.
+  registerLegalAdminRoutes(router, pool);
+  router.use((request, response, next) => requireActiveAccount(pool, request, response, next));
+  registerModerationRoutes(router, pool);
+  registerDestinationAdminRoutes(router, pool);
+  registerDocumentAdminRoutes(router, pool, storage);
+  registerOperationsAdminRoutes(router, pool);
 
   router.get('/settings', async (_request, response, next) => {
     try {
-      const maxOffersPerRequest = await getMaxOffersPerRequest(pool);
-      const changed = await pool.query("SELECT updated_at FROM platform_settings WHERE setting_key = 'max_offers_per_request'");
-      return response.json({ settings: { maxOffersPerRequest, maxOffersPerRequestBounds, updatedAt: changed.rows[0]?.updated_at ?? null } });
+      return response.json({ settings: await listSettings(pool) });
     } catch (error) {
       return next(error);
     }
   });
 
-  router.put('/settings/max-offers-per-request', requireCsrf, async (request, response, next) => {
-    const value = Number(request.body?.value);
-    if (!Number.isInteger(value) || value < maxOffersPerRequestBounds.min || value > maxOffersPerRequestBounds.max) {
-      return fail(response, 400, 'VALIDATION_ERROR', `Offer limit must be a whole number from ${maxOffersPerRequestBounds.min} to ${maxOffersPerRequestBounds.max}.`);
-    }
+  router.put('/settings/:key', requireCsrf, async (request, response, next) => {
+    const key = request.params.key;
+    if (!Object.hasOwn(platformSettingDefinitions, key)) return fail(response, 404, 'SETTING_NOT_FOUND', 'This platform setting does not exist.');
+    const definition = platformSettingDefinitions[key];
+    const parsed = settingSchema(key).safeParse(request.body?.value);
+    if (!parsed.success) return fail(response, 400, 'VALIDATION_ERROR', `${definition.label} must be a whole number from ${definition.min} to ${definition.max}.`);
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      const previous = await client.query("SELECT setting_value FROM platform_settings WHERE setting_key = 'max_offers_per_request' FOR UPDATE");
-      await client.query(
-        `INSERT INTO platform_settings (setting_key, setting_value, updated_by, updated_at)
-         VALUES ('max_offers_per_request', $1::jsonb, $2, NOW())
-         ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
-        [JSON.stringify(value), request.auth.user_id],
-      );
-      await client.query(
-        `INSERT INTO platform_setting_changes (id, setting_key, old_value, new_value, changed_by)
-         VALUES ($1, 'max_offers_per_request', $2::jsonb, $3::jsonb, $4)`,
-        [randomUUID(), previous.rowCount ? JSON.stringify(previous.rows[0].setting_value) : null, JSON.stringify(value), request.auth.user_id],
-      );
+      await updateSetting(client, key, parsed.data, request.auth.user_id);
       await client.query('COMMIT');
-      return response.json({ settings: { maxOffersPerRequest: value } });
+      return response.json({ settings: await listSettings(client) });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       return next(error);
@@ -108,16 +111,22 @@ export function createAdminRouter({ pool }) {
          WHERE p.verification_status = 'pending'
          ORDER BY p.updated_at ASC`,
       );
-      return response.json({ sellers: result.rows.map((seller) => ({
-        organizationId: seller.organization_id,
-        organizationName: seller.organization_name,
-        businessType: seller.business_type,
-        countryCode: seller.country_code,
-        coverageDestinations: seller.coverage_destinations,
-        propertyCity: seller.property_city,
-        status: seller.verification_status,
-        submittedAt: seller.updated_at,
-      })) });
+      const sellers = [];
+      for (const seller of result.rows) {
+        const documents = await verificationDocumentStatus(pool, { organizationId: seller.organization_id, businessType: seller.business_type, countryCode: seller.country_code });
+        sellers.push({
+          organizationId: seller.organization_id,
+          organizationName: seller.organization_name,
+          businessType: seller.business_type,
+          countryCode: seller.country_code,
+          coverageDestinations: seller.coverage_destinations,
+          propertyCity: seller.property_city,
+          status: seller.verification_status,
+          submittedAt: seller.updated_at,
+          documents,
+        });
+      }
+      return response.json({ sellers });
     } catch (error) {
       return next(error);
     }
@@ -132,6 +141,21 @@ export function createAdminRouter({ pool }) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      if (decision === 'approved') {
+        const seller = await client.query(
+          `SELECT o.business_type, o.country_code FROM organizations o JOIN seller_profiles p ON p.organization_id = o.id
+           WHERE o.id = $1 AND p.verification_status = 'pending' FOR UPDATE OF p`,
+          [request.params.organizationId],
+        );
+        if (seller.rowCount) {
+          const documents = await verificationDocumentStatus(client, { organizationId: request.params.organizationId, businessType: seller.rows[0].business_type, countryCode: seller.rows[0].country_code });
+          if (!documents.complete) {
+            await client.query('ROLLBACK');
+            const missing = documents.requirements.filter((item) => documents.missing.includes(item.type)).map((item) => item.label);
+            return fail(response, 409, 'DOCUMENTS_INCOMPLETE', `Approval needs every required document uploaded and scanned clean. Missing: ${missing.join('; ')}.`);
+          }
+        }
+      }
       const updated = await client.query(
         `UPDATE seller_profiles SET verification_status = $2, verification_reason = $3, updated_at = NOW()
          WHERE organization_id = $1 AND verification_status = 'pending'
@@ -150,23 +174,17 @@ export function createAdminRouter({ pool }) {
       if (decision === 'approved') {
         const retargeted = await client.query(
           `INSERT INTO request_targets (request_id, seller_organization_id)
-           SELECT r.id, p.organization_id
+           SELECT r.id, profile.organization_id
            FROM marketplace_requests r
-           JOIN seller_profiles p ON p.organization_id = $1
-           JOIN organizations seller ON seller.id = p.organization_id
-           WHERE r.status = 'open' AND r.response_deadline > NOW()
+           JOIN seller_profiles profile ON profile.organization_id = $1
+           JOIN organizations seller ON seller.id = profile.organization_id
+           WHERE r.status = 'open' AND r.response_deadline > NOW() AND ${organizationIsActive('seller')}
              AND (seller.business_type = 'dmc' OR (seller.business_type = 'hotelier' AND 'hotel' = ANY(r.services)))
              AND (
-               (r.visibility IN ('open', 'open_and_invite') AND (
-                 (seller.business_type = 'dmc' AND (
-                   lower(r.destination) = ANY(SELECT lower(destination) FROM unnest(p.coverage_destinations) AS destination)
-                   OR lower(r.destination_country) = ANY(SELECT lower(destination) FROM unnest(p.coverage_destinations) AS destination)
-                 ))
-                 OR (seller.business_type = 'hotelier' AND lower(p.property_city) = lower(r.destination))
-               ))
+               (r.visibility IN ('open', 'open_and_invite') AND ${sellerMatchesRequestDestination})
                OR (r.visibility IN ('invite_only', 'open_and_invite') AND EXISTS (
                  SELECT 1 FROM request_invitations invitation
-                 WHERE invitation.request_id = r.id AND invitation.seller_organization_id = p.organization_id
+                 WHERE invitation.request_id = r.id AND invitation.seller_organization_id = profile.organization_id
                ))
              )
            ON CONFLICT (request_id, seller_organization_id) DO UPDATE

@@ -1,16 +1,34 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Router } from 'express';
-import { loadSession, requireCsrf, requireMfaForPlatformAdmin } from './auth.routes.js';
+import { loadSession, requireActiveAccount, requireCsrf, requireMfaForPlatformAdmin } from './auth.routes.js';
 import { getMaxOffersPerRequest } from '../services/platformSettings.js';
+import { requireCapability } from '../services/permissions.js';
+import { config, isCurrencyCode } from '../config/index.js';
+import { capabilities, groupTypes as groupTypeOptions, hotelCategories, mealPlans as mealPlanOptions, requestVisibilities, serviceTypes as serviceOptions, valuesOf } from '../config/referenceData.js';
+import { loadLineItems, offerPricingDto, offerSchemaFor, offerTermsDto, replaceLineItems } from '../services/offerInput.js';
+import { contactDetailsPattern, containsContactDetails } from '../utils/contactDetails.js';
+import { parseWith } from '../utils/validation.js';
+import { createRateLimiter } from '../utils/rateLimit.js';
+import { z } from 'zod';
+import { reportCategories, reportTargetTypes } from '../config/referenceData.js';
+import { findDestination, sellerMatchesRequestDestination, sellerProfileResponse } from '../services/destinations.js';
+import { organizationIsActive } from '../services/organizationLifecycle.js';
 
-const groupTypes = new Set(['family', 'honeymoon', 'friends', 'corporate', 'school', 'seniors', 'solo', 'other']);
-const mealPlans = new Set(['room_only', 'breakfast', 'half_board', 'full_board', 'all_inclusive']);
-const serviceTypes = new Set(['hotel', 'transfers', 'sightseeing', 'guide', 'visa', 'flights']);
-const offerInclusions = new Set(['accommodation', 'breakfast', 'transfers', 'sightseeing', 'guide', 'taxes', 'visa', 'flights', 'meals', 'rail', 'insurance']);
-const contactDetailsPattern = /(?:\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b|\b(?:https?:\/\/|www\.)\S+|\b\+\d[\d\s().-]{6,}\d\b|\b\d{10,15}\b)/i;
-const visibilities = new Set(['open', 'invite_only', 'open_and_invite']);
+const reportSchema = z.object({
+  target_type: z.enum(reportTargetTypes.map((item) => item.value), { error: 'Choose what you are reporting.' }),
+  target_id: z.uuid('Choose a valid item to report.'),
+  category: z.enum(reportCategories.map((item) => item.value), { error: 'Choose a report reason.' }),
+  details: z.string().trim().max(2000).nullish().transform((value) => value || null),
+});
+
+const groupTypes = valuesOf(groupTypeOptions);
+const mealPlans = valuesOf(mealPlanOptions);
+const serviceTypes = valuesOf(serviceOptions);
+const hotelCategoryValues = valuesOf(hotelCategories);
+const visibilities = valuesOf(requestVisibilities);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const maxInvitedSellers = 20;
+const hourMs = 60 * 60 * 1000;
+const dayMs = 24 * hourMs;
 // Closed requests stay visible to sellers whose offer is still under review.
 const sellerCanSeeRequest = `(r.status = 'open'
   OR (r.status = 'closed' AND EXISTS (SELECT 1 FROM offers own WHERE own.request_id = r.id
@@ -29,6 +47,31 @@ async function notify(pool, organizationId, eventType, title, message, data) {
   );
 }
 
+function offerDto(row, { lineItems = [], request, sellerName } = {}) {
+  const minor = (value) => value == null ? null : Number(value);
+  return {
+    id: row.id,
+    requestId: row.request_id,
+    sellerOrganizationId: row.seller_organization_id,
+    ...(sellerName ? { sellerName } : {}),
+    kind: row.offer_kind,
+    totalMinor: minor(row.total_minor),
+    ratePerNightMinor: minor(row.rate_per_night_minor),
+    roomType: row.room_type,
+    mealPlan: row.meal_plan,
+    currency: row.currency,
+    inclusions: row.inclusions,
+    exclusions: row.exclusions,
+    validityUntil: row.validity_until,
+    status: row.status,
+    outcomeReason: row.outcome_reason ?? null,
+    createdAt: row.created_at,
+    ...offerTermsDto(row),
+    ...(request ? offerPricingDto(row, request) : {}),
+    lineItems,
+  };
+}
+
 function validDate(value) {
   return typeof value === 'string'
     && /^\d{4}-\d{2}-\d{2}$/.test(value)
@@ -37,8 +80,7 @@ function validDate(value) {
 }
 
 function validRequest(body) {
-  const destination = typeof body.destination === 'string' ? body.destination.trim() : '';
-  const countryCode = typeof body.destination_country === 'string' ? body.destination_country.trim().toUpperCase() : '';
+  const destinationId = typeof body.destination_id === 'string' ? body.destination_id : '';
   const travelMonth = typeof body.travel_month === 'string' ? body.travel_month : null;
   const hasDates = validDate(body.travel_start_date) && validDate(body.travel_end_date) && body.travel_end_date > body.travel_start_date;
   const hasMonth = typeof travelMonth === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(travelMonth);
@@ -54,8 +96,7 @@ function validRequest(body) {
   const visibility = body.visibility ?? 'open';
   const invitedSellerIds = Array.isArray(body.invited_seller_ids) ? [...new Set(body.invited_seller_ids)] : [];
 
-  if (destination.length < 2 || destination.length > 120) return { error: 'Destination must be between 2 and 120 characters.' };
-  if (!/^[A-Z]{2}$/.test(countryCode)) return { error: 'Choose a valid ISO country code.' };
+  if (!uuidPattern.test(destinationId)) return { error: 'Choose a destination from the destination list.' };
   if (!hasDates && !hasMonth) return { error: 'Provide exact travel dates or a travel month.' };
   if (hasDates && travelMonth) return { error: 'Choose exact dates or a travel month, not both.' };
   if (!Number.isInteger(nights) || nights < 1 || nights > 90) return { error: 'Nights must be between 1 and 90.' };
@@ -65,20 +106,23 @@ function validRequest(body) {
   if (!Number.isInteger(infants) || infants < 0 || infants > 40) return { error: 'Infants must be between 0 and 40.' };
   if (!groupTypes.has(body.group_type)) return { error: 'Choose a supported group type.' };
   if (!services.length || services.length > serviceTypes.size || services.some((service) => !serviceTypes.has(service))) return { error: 'Choose one or more supported services.' };
-  if (body.hotel_category != null && ![3, 4, 5].includes(Number(body.hotel_category))) return { error: 'Hotel category must be 3, 4 or 5 stars.' };
+  if (body.hotel_category != null && !hotelCategoryValues.has(Number(body.hotel_category))) return { error: 'Choose a supported hotel category.' };
   if (body.room_count != null && (!Number.isInteger(Number(body.room_count)) || Number(body.room_count) < 1 || Number(body.room_count) > 50)) return { error: 'Room count must be between 1 and 50.' };
   if (body.meal_plan != null && !mealPlans.has(body.meal_plan)) return { error: 'Choose a supported meal plan.' };
-  if (!responseDeadline || Number.isNaN(responseDeadline.getTime()) || responseDeadline <= new Date() || responseDeadline > new Date(Date.now() + 90 * 86400000)) return { error: 'Response deadline must be within the next 90 days.' };
+  if (!responseDeadline || Number.isNaN(responseDeadline.getTime())
+    || responseDeadline < new Date(Date.now() + config.requestDeadline.minHours * hourMs)
+    || responseDeadline > new Date(Date.now() + config.requestDeadline.maxDays * dayMs)) {
+    return { error: `Response deadline must be between ${config.requestDeadline.minHours} hour(s) and ${config.requestDeadline.maxDays} days from now.` };
+  }
   if ((budgetMin == null) !== (budgetMax == null)) return { error: 'Provide both budget bounds or neither.' };
-  if (budgetMin != null && (!Number.isSafeInteger(budgetMin) || !Number.isSafeInteger(budgetMax) || budgetMin < 0 || budgetMax < budgetMin || !/^[A-Z]{3}$/.test(budgetCurrency ?? ''))) return { error: 'Budget requires valid minor-unit bounds and an ISO currency code.' };
+  if (budgetMin != null && (!Number.isSafeInteger(budgetMin) || !Number.isSafeInteger(budgetMax) || budgetMin < 0 || budgetMax < budgetMin || !isCurrencyCode(budgetCurrency))) return { error: 'Budget requires valid minor-unit bounds and an ISO currency code.' };
   if (!visibilities.has(visibility)) return { error: 'Choose open, invite-only, or open and invited visibility.' };
-  if (invitedSellerIds.length > maxInvitedSellers || invitedSellerIds.some((id) => typeof id !== 'string' || !uuidPattern.test(id))) return { error: `Invite up to ${maxInvitedSellers} verified suppliers.` };
+  if (invitedSellerIds.length > config.maxInvitedSuppliers || invitedSellerIds.some((id) => typeof id !== 'string' || !uuidPattern.test(id))) return { error: `Invite up to ${config.maxInvitedSuppliers} verified suppliers.` };
   if (visibility === 'open' && invitedSellerIds.length) return { error: 'Open requests cannot include invited suppliers. Choose invite-only or open and invited visibility.' };
   if (visibility === 'invite_only' && !invitedSellerIds.length) return { error: 'Invite at least one verified supplier for an invite-only request.' };
 
   return {
-    destination,
-    countryCode,
+    destinationId,
     travelStartDate: hasDates ? body.travel_start_date : null,
     travelEndDate: hasDates ? body.travel_end_date : null,
     travelMonth: hasMonth ? travelMonth : null,
@@ -111,6 +155,7 @@ function requestDto(row) {
     id: row.id,
     requestCode: row.request_code,
     destination: row.destination,
+    destinationId: row.destination_id ?? null,
     destinationCountry: row.destination_country,
     country: row.destination_country,
     travelStartDate: startDate,
@@ -148,17 +193,18 @@ function sellerRequestDto(row, offerLimit) {
 
 export function createMarketplaceRouter({ pool }) {
   const router = Router();
+  const reportLimiter = createRateLimiter(config.rateLimits.report, 'Too many reports. Try again later.');
   router.use((request, response, next) => loadSession(pool, request, response, next));
   router.use(requireMfaForPlatformAdmin);
+  router.use((request, response, next) => requireActiveAccount(pool, request, response, next));
   router.use((request, response, next) => request.method === 'GET' ? next() : requireCsrf(request, response, next));
 
   router.get('/seller-profile', async (request, response, next) => {
     if (!['dmc', 'hotelier'].includes(request.auth.business_type)) return fail(response, 403, 'ROLE_FORBIDDEN', 'Seller profile is only available to DMCs and hoteliers.');
     try {
-      const result = await pool.query('SELECT coverage_destinations, property_city, verification_status, verification_reason FROM seller_profiles WHERE organization_id = $1', [request.auth.organization_id]);
-      if (!result.rowCount) return fail(response, 404, 'PROFILE_NOT_FOUND', 'Seller profile was not found.');
-      const profile = result.rows[0];
-      return response.json({ coverageDestinations: profile.coverage_destinations, propertyCity: profile.property_city, verificationStatus: profile.verification_status, verificationReason: profile.verification_reason });
+      const profile = await sellerProfileResponse(pool, request.auth.organization_id);
+      if (!profile) return fail(response, 404, 'PROFILE_NOT_FOUND', 'Seller profile was not found.');
+      return response.json(profile);
     } catch (error) {
       return next(error);
     }
@@ -176,7 +222,7 @@ export function createMarketplaceRouter({ pool }) {
     try {
       const searchPattern = search ? `%${search}%` : null;
       const values = [searchPattern, country || null];
-      const where = `p.verification_status = 'approved' AND o.business_type IN ('dmc', 'hotelier')
+      const where = `p.verification_status = 'approved' AND ${organizationIsActive('o')} AND o.business_type IN ('dmc', 'hotelier')
         AND ($1::text IS NULL OR o.name ILIKE $1 OR p.property_city ILIKE $1
           OR EXISTS (SELECT 1 FROM unnest(p.coverage_destinations) AS destination WHERE destination ILIKE $1))
         AND ($2::text IS NULL OR o.country_code = $2)`;
@@ -229,7 +275,7 @@ export function createMarketplaceRouter({ pool }) {
     }
   });
 
-  router.put('/hotel/inventory', async (request, response, next) => {
+  router.put('/hotel/inventory', requireCapability(capabilities.profileManage), async (request, response, next) => {
     if (request.auth.business_type !== 'hotelier') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only hotelier accounts can update room inventory.');
     if (!Array.isArray(request.body?.inventory) || request.body.inventory.length < 1 || request.body.inventory.length > 300) return fail(response, 400, 'VALIDATION_ERROR', 'Submit between 1 and 300 room inventory rows.');
     const inventory = [];
@@ -239,10 +285,10 @@ export function createMarketplaceRouter({ pool }) {
       const roomType = typeof item?.room_type === 'string' ? item.room_type.trim() : '';
       const availableRooms = Number(item?.available_rooms);
       const nightlyRateMinor = item?.nightly_rate_minor == null || item.nightly_rate_minor === '' ? null : Number(item.nightly_rate_minor);
-      const currency = typeof item?.currency === 'string' ? item.currency.toUpperCase() : 'USD';
+      const currency = typeof item?.currency === 'string' ? item.currency.toUpperCase() : config.defaultCurrency;
       if (!validDate(date) || roomType.length < 2 || roomType.length > 120 || !Number.isInteger(availableRooms) || availableRooms < 0 || availableRooms > 100) return fail(response, 400, 'VALIDATION_ERROR', 'Each row needs a valid date, room type and availability from 0 to 100.');
       if (nightlyRateMinor != null && (!Number.isSafeInteger(nightlyRateMinor) || nightlyRateMinor < 0)) return fail(response, 400, 'VALIDATION_ERROR', 'Nightly rate must be non-negative integer minor units.');
-      if (!/^[A-Z]{3}$/.test(currency)) return fail(response, 400, 'VALIDATION_ERROR', 'Use an ISO 4217 currency code.');
+      if (!isCurrencyCode(currency)) return fail(response, 400, 'VALIDATION_ERROR', 'Use an ISO 4217 currency code.');
       const uniqueKey = `${date}|${roomType.toLowerCase()}`;
       if (uniqueKeys.has(uniqueKey)) return fail(response, 400, 'VALIDATION_ERROR', 'Room type and date rows must be unique.');
       uniqueKeys.add(uniqueKey);
@@ -395,7 +441,7 @@ export function createMarketplaceRouter({ pool }) {
     }
   });
 
-  router.post('/requests/:requestId/messages', async (request, response, next) => {
+  router.post('/requests/:requestId/messages', requireCapability(capabilities.messageWrite), async (request, response, next) => {
     const sellerOrganizationId = request.auth.business_type === 'agency'
       ? request.body?.seller_organization_id
       : request.auth.organization_id;
@@ -446,7 +492,7 @@ export function createMarketplaceRouter({ pool }) {
     }
   });
 
-  router.post('/requests', async (request, response, next) => {
+  router.post('/requests', requireCapability(capabilities.requestWrite), async (request, response, next) => {
     if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only travel agencies can create marketplace requests.');
     const input = validRequest(request.body ?? {});
     if (input.error) return fail(response, 400, 'VALIDATION_ERROR', input.error);
@@ -455,12 +501,17 @@ export function createMarketplaceRouter({ pool }) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      const destination = await findDestination(client, input.destinationId);
+      if (!destination?.active) {
+        await client.query('ROLLBACK');
+        return fail(response, 400, 'VALIDATION_ERROR', 'Choose a destination from the destination list.');
+      }
       if (input.invitedSellerIds.length) {
         const eligible = await client.query(
           `SELECT o.id, o.business_type FROM organizations o
            JOIN seller_profiles p ON p.organization_id = o.id
            WHERE o.id = ANY($1::uuid[]) AND o.id <> $2
-             AND o.business_type IN ('dmc', 'hotelier') AND p.verification_status = 'approved'`,
+             AND o.business_type IN ('dmc', 'hotelier') AND p.verification_status = 'approved' AND ${organizationIsActive('o')}`,
           [input.invitedSellerIds, request.auth.organization_id],
         );
         if (eligible.rowCount !== input.invitedSellerIds.length) {
@@ -477,14 +528,14 @@ export function createMarketplaceRouter({ pool }) {
            id, request_code, agency_organization_id, destination, destination_country,
            travel_start_date, travel_end_date, travel_month, nights, adults, children, infants,
            group_type, hotel_category, room_count, meal_plan, services,
-           budget_min_minor, budget_max_minor, budget_currency, response_deadline, visibility
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+           budget_min_minor, budget_max_minor, budget_currency, response_deadline, visibility, destination_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
          RETURNING *`,
-        [id, requestCode, request.auth.organization_id, input.destination, input.countryCode,
+        [id, requestCode, request.auth.organization_id, destination.name, destination.country_code,
           input.travelStartDate, input.travelEndDate, input.travelMonth, input.nights, input.adults,
           input.children, input.infants, input.groupType, input.hotelCategory, input.roomCount,
           input.mealPlan, input.services, input.budgetMin, input.budgetMax, input.budgetCurrency,
-          input.responseDeadline, input.visibility],
+          input.responseDeadline, input.visibility, destination.id],
       );
       for (const sellerId of input.invitedSellerIds) {
         await client.query('INSERT INTO request_invitations (request_id, seller_organization_id) VALUES ($1, $2)', [id, sellerId]);
@@ -505,7 +556,7 @@ export function createMarketplaceRouter({ pool }) {
     }
   });
 
-  router.post('/requests/:requestId/publish', async (request, response, next) => {
+  router.post('/requests/:requestId/publish', requireCapability(capabilities.requestWrite), async (request, response, next) => {
     if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the owning agency can publish this request.');
     const client = await pool.connect();
     try {
@@ -534,27 +585,24 @@ export function createMarketplaceRouter({ pool }) {
       const row = updated.rows[0];
       const targets = await client.query(
         `INSERT INTO request_targets (request_id, seller_organization_id)
-         SELECT $1, profile.organization_id
-         FROM seller_profiles profile
+         SELECT r.id, profile.organization_id
+         FROM marketplace_requests r
+         CROSS JOIN seller_profiles profile
          JOIN organizations seller ON seller.id = profile.organization_id
-         WHERE profile.verification_status = 'approved'
+         WHERE r.id = $1
+           AND profile.verification_status = 'approved'
+           AND ${organizationIsActive('seller')}
            AND seller.id <> $2
-           AND (seller.business_type = 'dmc' OR (seller.business_type = 'hotelier' AND 'hotel' = ANY($5::text[])))
+           AND (seller.business_type = 'dmc' OR (seller.business_type = 'hotelier' AND 'hotel' = ANY(r.services)))
            AND (
-             ($6::text IN ('open', 'open_and_invite') AND (
-               (seller.business_type = 'dmc' AND (
-                 lower($3) = ANY(SELECT lower(destination) FROM unnest(profile.coverage_destinations) AS destination)
-                 OR lower($4) = ANY(SELECT lower(destination) FROM unnest(profile.coverage_destinations) AS destination)
-               ))
-               OR (seller.business_type = 'hotelier' AND lower(profile.property_city) = lower($3))
-             ))
-             OR ($6::text IN ('invite_only', 'open_and_invite') AND EXISTS (
+             (r.visibility IN ('open', 'open_and_invite') AND ${sellerMatchesRequestDestination})
+             OR (r.visibility IN ('invite_only', 'open_and_invite') AND EXISTS (
                SELECT 1 FROM request_invitations invitation
-               WHERE invitation.request_id = $1 AND invitation.seller_organization_id = seller.id
+               WHERE invitation.request_id = r.id AND invitation.seller_organization_id = seller.id
              ))
            )
          ON CONFLICT DO NOTHING RETURNING seller_organization_id`,
-        [row.id, request.auth.organization_id, row.destination, row.destination_country, row.services, row.visibility],
+        [row.id, request.auth.organization_id],
       );
       await client.query(
         `UPDATE marketplace_requests r SET seller_visible_snapshot = jsonb_build_object(
@@ -583,7 +631,7 @@ export function createMarketplaceRouter({ pool }) {
     }
   });
 
-  router.post('/requests/:requestId/close', async (request, response, next) => {
+  router.post('/requests/:requestId/close', requireCapability(capabilities.requestWrite), async (request, response, next) => {
     if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the owning agency can close this request.');
     try {
       const result = await pool.query(
@@ -598,7 +646,7 @@ export function createMarketplaceRouter({ pool }) {
     }
   });
 
-  router.post('/requests/:requestId/decline', async (request, response, next) => {
+  router.post('/requests/:requestId/decline', requireCapability(capabilities.offerWrite), async (request, response, next) => {
     if (!['dmc', 'hotelier'].includes(request.auth.business_type)) return fail(response, 403, 'ROLE_FORBIDDEN', 'Only matched sellers can decline a request.');
     const reason = typeof request.body?.reason === 'string' ? request.body.reason.trim() : '';
     if (reason.length < 5 || reason.length > 300) return fail(response, 400, 'VALIDATION_ERROR', 'Provide a decline reason between 5 and 300 characters.');
@@ -617,23 +665,14 @@ export function createMarketplaceRouter({ pool }) {
     }
   });
 
-  router.post('/requests/:requestId/offers', async (request, response, next) => {
+  router.post('/requests/:requestId/offers', requireCapability(capabilities.offerWrite), async (request, response, next) => {
     const isDmc = request.auth.business_type === 'dmc';
     const isHotelier = request.auth.business_type === 'hotelier';
     if (!isDmc && !isHotelier) return fail(response, 403, 'ROLE_FORBIDDEN', 'Only DMCs and hoteliers can submit seller offers.');
-    const totalMinor = isDmc ? Number(request.body?.total_minor) : null;
-    const ratePerNightMinor = isHotelier ? Number(request.body?.rate_per_night_minor) : null;
-    const roomType = isHotelier && typeof request.body?.room_type === 'string' ? request.body.room_type.trim() : null;
-    const mealPlan = isHotelier && mealPlans.has(request.body?.meal_plan) ? request.body.meal_plan : null;
-    const currency = typeof request.body?.currency === 'string' ? request.body.currency.toUpperCase() : '';
-    const inclusions = Array.isArray(request.body?.inclusions) ? [...new Set(request.body.inclusions)] : [];
-    const exclusions = Array.isArray(request.body?.exclusions) ? [...new Set(request.body.exclusions)] : [];
-    const validityUntil = typeof request.body?.validity_until === 'string' ? new Date(request.body.validity_until) : null;
-    if (isDmc && (!Number.isSafeInteger(totalMinor) || totalMinor <= 0)) return fail(response, 400, 'VALIDATION_ERROR', 'Offer total must be a positive integer in minor currency units.');
-    if (isHotelier && (!Number.isSafeInteger(ratePerNightMinor) || ratePerNightMinor <= 0 || !roomType || roomType.length > 120)) return fail(response, 400, 'VALIDATION_ERROR', 'A valid per-night rate and room type are required.');
-    if (!/^[A-Z]{3}$/.test(currency)) return fail(response, 400, 'VALIDATION_ERROR', 'Use an ISO 4217 currency code.');
-    if (inclusions.length > 20 || exclusions.length > 20 || [...inclusions, ...exclusions].some((item) => !offerInclusions.has(item))) return fail(response, 400, 'VALIDATION_ERROR', 'Use supported structured inclusion and exclusion values.');
-    if (!validityUntil || Number.isNaN(validityUntil.getTime()) || validityUntil <= new Date()) return fail(response, 400, 'VALIDATION_ERROR', 'Offer validity must be in the future.');
+    const offerKind = isDmc ? 'land_package' : 'hotel_room';
+    const input = parseWith(offerSchemaFor(offerKind), request.body);
+    if (input.error) return fail(response, 400, 'VALIDATION_ERROR', input.error);
+    const offerInput = input.data;
 
     const client = await pool.connect();
     try {
@@ -644,7 +683,8 @@ export function createMarketplaceRouter({ pool }) {
         return fail(response, 403, 'SELLER_NOT_VERIFIED', 'Your seller profile must be verified before submitting offers.');
       }
       const target = await client.query(
-        `SELECT r.id, r.agency_organization_id, r.request_code, r.destination, r.services, r.response_deadline
+        `SELECT r.id, r.agency_organization_id, r.request_code, r.destination, r.services, r.response_deadline,
+                r.adults, r.children, r.nights, r.room_count
          FROM request_targets t JOIN marketplace_requests r ON r.id = t.request_id
          WHERE t.request_id = $1 AND t.seller_organization_id = $2 AND t.declined_at IS NULL AND r.status = 'open'
          FOR UPDATE OF r`,
@@ -674,17 +714,24 @@ export function createMarketplaceRouter({ pool }) {
       }
       const result = await client.query(
         `INSERT INTO offers (id, request_id, seller_organization_id, offer_kind, total_minor, rate_per_night_minor,
-           room_type, currency, inclusions, exclusions, meal_plan, validity_until)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-         RETURNING id, request_id, offer_kind, total_minor, rate_per_night_minor, room_type, currency,
-           inclusions, exclusions, meal_plan, validity_until, status, created_at`,
-        [randomUUID(), request.params.requestId, request.auth.organization_id, isDmc ? 'land_package' : 'hotel_room',
-          totalMinor, ratePerNightMinor, roomType, currency, inclusions, exclusions, mealPlan, validityUntil],
+           room_type, currency, inclusions, exclusions, meal_plan, validity_until, cancellation_policy,
+           free_cancellation_until, deposit_percent, balance_due_days_before_travel, payment_notes,
+           room_count, taxes_included, availability_confirmed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+         RETURNING *`,
+        [randomUUID(), request.params.requestId, request.auth.organization_id, offerKind,
+          offerInput.total_minor ?? null, offerInput.rate_per_night_minor ?? null, offerInput.room_type ?? null,
+          offerInput.currency, offerInput.inclusions, offerInput.exclusions, offerInput.meal_plan ?? null, offerInput.validity_until,
+          offerInput.cancellation_policy, offerInput.free_cancellation_until, offerInput.deposit_percent,
+          offerInput.balance_due_days_before_travel, offerInput.payment_notes, offerInput.room_count ?? null,
+          offerInput.taxes_included ?? null, offerInput.availability_confirmed ?? null],
       );
       const offer = result.rows[0];
+      await replaceLineItems(client, offer.id, offerInput.line_items ?? [], randomUUID);
+      const lineItems = await loadLineItems(client, [offer.id]);
       await notify(client, target.rows[0].agency_organization_id, 'offer_submitted', 'New seller offer', `${target.rows[0].request_code} / ${request.auth.organization_name} / ${target.rows[0].destination}`, { requestId: request.params.requestId, requestCode: target.rows[0].request_code, offerId: offer.id });
       await client.query('COMMIT');
-      return response.status(201).json({ offer: { id: offer.id, requestId: offer.request_id, kind: offer.offer_kind, totalMinor: offer.total_minor, ratePerNightMinor: offer.rate_per_night_minor, roomType: offer.room_type, currency: offer.currency, inclusions: offer.inclusions, exclusions: offer.exclusions, mealPlan: offer.meal_plan, validityUntil: offer.validity_until, status: offer.status, createdAt: offer.created_at } });
+      return response.status(201).json({ offer: offerDto(offer, { lineItems: lineItems.get(offer.id), request: target.rows[0] }) });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       if (error.code === '23505') return fail(response, 409, 'OFFER_ALREADY_SUBMITTED', 'Your organization already has an active offer for this request.');
@@ -697,11 +744,10 @@ export function createMarketplaceRouter({ pool }) {
   router.get('/requests/:requestId/offers', async (request, response, next) => {
     if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the requesting agency can compare offers.');
     try {
-      const ownedRequest = await pool.query('SELECT id FROM marketplace_requests WHERE id = $1 AND agency_organization_id = $2', [request.params.requestId, request.auth.organization_id]);
+      const ownedRequest = await pool.query('SELECT id, adults, children, nights, room_count FROM marketplace_requests WHERE id = $1 AND agency_organization_id = $2', [request.params.requestId, request.auth.organization_id]);
       if (!ownedRequest.rowCount) return fail(response, 404, 'REQUEST_NOT_FOUND', 'Request was not found.');
       const result = await pool.query(
-        `SELECT f.id, f.seller_organization_id, f.offer_kind, f.total_minor, f.rate_per_night_minor, f.room_type, f.meal_plan, f.currency, f.inclusions, f.exclusions,
-                f.validity_until, f.status, f.created_at, seller.name AS seller_name
+        `SELECT f.*, seller.name AS seller_name
          FROM offers f JOIN organizations seller ON seller.id = f.seller_organization_id
          JOIN seller_profiles profile ON profile.organization_id = seller.id
          WHERE f.request_id = $1 AND profile.verification_status = 'approved'
@@ -709,7 +755,8 @@ export function createMarketplaceRouter({ pool }) {
          ORDER BY f.created_at ASC`,
         [request.params.requestId],
       );
-      return response.json({ offers: result.rows.map((offer) => ({ id: offer.id, sellerOrganizationId: offer.seller_organization_id, sellerName: offer.seller_name, kind: offer.offer_kind, totalMinor: offer.total_minor, ratePerNightMinor: offer.rate_per_night_minor, roomType: offer.room_type, mealPlan: offer.meal_plan, currency: offer.currency, inclusions: offer.inclusions, exclusions: offer.exclusions, validityUntil: offer.validity_until, status: offer.status, createdAt: offer.created_at })) });
+      const lineItems = await loadLineItems(pool, result.rows.map((row) => row.id));
+      return response.json({ offers: result.rows.map((offer) => offerDto(offer, { lineItems: lineItems.get(offer.id), request: ownedRequest.rows[0], sellerName: offer.seller_name })) });
     } catch (error) {
       return next(error);
     }
@@ -718,10 +765,8 @@ export function createMarketplaceRouter({ pool }) {
   router.get('/offers/:offerId', async (request, response, next) => {
     try {
       const result = await pool.query(
-        `SELECT f.id, f.request_id, f.seller_organization_id, f.offer_kind, f.total_minor,
-                f.rate_per_night_minor, f.room_type, f.currency, f.inclusions, f.exclusions,
-                f.meal_plan, f.cancellation_policy, f.validity_until, f.status, f.created_at,
-                r.agency_organization_id, r.request_code, r.destination, seller.name AS seller_name
+        `SELECT f.*, r.agency_organization_id, r.request_code, r.destination, r.adults, r.children, r.nights,
+                r.room_count AS request_room_count, seller.name AS seller_name
          FROM offers f JOIN marketplace_requests r ON r.id = f.request_id
          JOIN organizations seller ON seller.id = f.seller_organization_id
          WHERE f.id = $1`,
@@ -732,7 +777,9 @@ export function createMarketplaceRouter({ pool }) {
       const isOwnSellerOffer = offer.seller_organization_id === request.auth.organization_id;
       const isRequestingAgency = offer.agency_organization_id === request.auth.organization_id && request.auth.business_type === 'agency';
       if (!isOwnSellerOffer && !isRequestingAgency) return fail(response, 404, 'OFFER_NOT_FOUND', 'Offer was not found.');
-      return response.json({ offer: { id: offer.id, requestId: offer.request_id, requestCode: offer.request_code, destination: offer.destination, kind: offer.offer_kind, totalMinor: offer.total_minor, ratePerNightMinor: offer.rate_per_night_minor, roomType: offer.room_type, currency: offer.currency, inclusions: offer.inclusions, exclusions: offer.exclusions, mealPlan: offer.meal_plan, cancellationPolicy: offer.cancellation_policy, validityUntil: offer.validity_until, status: offer.status, createdAt: offer.created_at, ...(isRequestingAgency ? { sellerName: offer.seller_name } : {}) } });
+      const lineItems = await loadLineItems(pool, [offer.id]);
+      const requestFacts = { adults: offer.adults, children: offer.children, nights: offer.nights, room_count: offer.request_room_count };
+      return response.json({ offer: { ...offerDto(offer, { lineItems: lineItems.get(offer.id), request: requestFacts, sellerName: isRequestingAgency ? offer.seller_name : undefined }), requestCode: offer.request_code, destination: offer.destination } });
     } catch (error) {
       return next(error);
     }
@@ -753,21 +800,21 @@ export function createMarketplaceRouter({ pool }) {
     }
   });
 
-  router.put('/offers/:offerId', async (request, response, next) => {
+  router.put('/offers/:offerId', requireCapability(capabilities.offerWrite), async (request, response, next) => {
     if (!['dmc', 'hotelier'].includes(request.auth.business_type)) return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the seller can revise its offer.');
-    const currency = typeof request.body?.currency === 'string' ? request.body.currency.toUpperCase() : '';
-    const inclusions = Array.isArray(request.body?.inclusions) ? [...new Set(request.body.inclusions)] : [];
-    const exclusions = Array.isArray(request.body?.exclusions) ? [...new Set(request.body.exclusions)] : [];
-    const validityUntil = typeof request.body?.validity_until === 'string' ? new Date(request.body.validity_until) : null;
-    if (!/^[A-Z]{3}$/.test(currency) || !validityUntil || Number.isNaN(validityUntil.getTime()) || validityUntil <= new Date()) return fail(response, 400, 'VALIDATION_ERROR', 'Provide a supported currency and future offer validity.');
-    if ([...inclusions, ...exclusions].some((item) => !offerInclusions.has(item))) return fail(response, 400, 'VALIDATION_ERROR', 'Use supported structured inclusion and exclusion values.');
+    const offerKind = request.auth.business_type === 'dmc' ? 'land_package' : 'hotel_room';
+    const input = parseWith(offerSchemaFor(offerKind), request.body);
+    if (input.error) return fail(response, 400, 'VALIDATION_ERROR', input.error);
+    const offerInput = input.data;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
       const current = await client.query(
-        `SELECT f.*, r.agency_organization_id, r.response_deadline FROM offers f JOIN marketplace_requests r ON r.id = f.request_id
+        `SELECT f.*, r.agency_organization_id, r.response_deadline, r.adults, r.children, r.nights,
+                r.room_count AS request_room_count
+         FROM offers f JOIN marketplace_requests r ON r.id = f.request_id
          WHERE f.id = $1 AND f.seller_organization_id = $2 AND r.status = 'open'
-           AND f.status IN ('submitted', 'shortlisted') FOR UPDATE`,
+           AND f.status IN ('submitted', 'shortlisted') FOR UPDATE OF f`,
         [request.params.offerId, request.auth.organization_id],
       );
       if (!current.rowCount) {
@@ -779,39 +826,34 @@ export function createMarketplaceRouter({ pool }) {
         await client.query('ROLLBACK');
         return fail(response, 409, 'RESPONSE_DEADLINE_PASSED', 'Offers cannot be revised after the response deadline.');
       }
-      if ((request.auth.business_type === 'dmc' && oldOffer.offer_kind !== 'land_package') || (request.auth.business_type === 'hotelier' && oldOffer.offer_kind !== 'hotel_room')) {
+      if (oldOffer.offer_kind !== offerKind) {
         await client.query('ROLLBACK');
         return fail(response, 403, 'ROLE_FORBIDDEN', 'This offer type does not belong to your seller role.');
       }
-      const valueMinor = Number(request.body?.total_minor ?? request.body?.rate_per_night_minor);
-      if (!Number.isSafeInteger(valueMinor) || valueMinor <= 0) {
-        await client.query('ROLLBACK');
-        return fail(response, 400, 'VALIDATION_ERROR', 'Offer price must be a positive integer in minor units.');
-      }
-      const roomType = oldOffer.offer_kind === 'hotel_room' && typeof request.body?.room_type === 'string' ? request.body.room_type.trim() : oldOffer.room_type;
-      if (oldOffer.offer_kind === 'hotel_room' && (!roomType || roomType.length > 120)) {
-        await client.query('ROLLBACK');
-        return fail(response, 400, 'VALIDATION_ERROR', 'Provide a valid room type.');
-      }
+      const oldLineItems = await loadLineItems(client, [oldOffer.id]);
       const latestRevision = await client.query('SELECT COALESCE(MAX(revision_number), 0) AS revision_number FROM offer_revisions WHERE offer_id = $1', [oldOffer.id]);
-      const snapshot = { offerKind: oldOffer.offer_kind, totalMinor: oldOffer.total_minor, ratePerNightMinor: oldOffer.rate_per_night_minor, roomType: oldOffer.room_type, currency: oldOffer.currency, inclusions: oldOffer.inclusions, exclusions: oldOffer.exclusions, mealPlan: oldOffer.meal_plan, cancellationPolicy: oldOffer.cancellation_policy, validityUntil: oldOffer.validity_until, status: oldOffer.status };
+      const requestFacts = { adults: oldOffer.adults, children: oldOffer.children, nights: oldOffer.nights, room_count: oldOffer.request_room_count };
+      const snapshot = offerDto(oldOffer, { lineItems: oldLineItems.get(oldOffer.id), request: requestFacts });
       await client.query('INSERT INTO offer_revisions (id, offer_id, revision_number, snapshot) VALUES ($1, $2, $3, $4)', [randomUUID(), oldOffer.id, Number(latestRevision.rows[0].revision_number) + 1, JSON.stringify(snapshot)]);
       const revised = await client.query(
         `UPDATE offers SET total_minor = $2, rate_per_night_minor = $3, room_type = $4,
            currency = $5, inclusions = $6, exclusions = $7, meal_plan = $8,
-           cancellation_policy = $9, validity_until = $10, status = 'submitted', updated_at = NOW()
-         WHERE id = $1
-         RETURNING id, request_id, offer_kind, total_minor, rate_per_night_minor, room_type,
-           currency, inclusions, exclusions, meal_plan, cancellation_policy, validity_until, status`,
-        [oldOffer.id, oldOffer.offer_kind === 'land_package' ? valueMinor : null,
-          oldOffer.offer_kind === 'hotel_room' ? valueMinor : null, roomType, currency,
-          inclusions, exclusions, oldOffer.offer_kind === 'hotel_room' ? request.body?.meal_plan ?? oldOffer.meal_plan : null,
-          typeof request.body?.cancellation_policy === 'string' ? request.body.cancellation_policy.slice(0, 1000) : oldOffer.cancellation_policy,
-          validityUntil],
+           cancellation_policy = $9, validity_until = $10, free_cancellation_until = $11,
+           deposit_percent = $12, balance_due_days_before_travel = $13, payment_notes = $14,
+           room_count = $15, taxes_included = $16, availability_confirmed = $17,
+           status = 'submitted', updated_at = NOW()
+         WHERE id = $1 RETURNING *`,
+        [oldOffer.id, offerInput.total_minor ?? null, offerInput.rate_per_night_minor ?? null, offerInput.room_type ?? null,
+          offerInput.currency, offerInput.inclusions, offerInput.exclusions, offerInput.meal_plan ?? null,
+          offerInput.cancellation_policy, offerInput.validity_until, offerInput.free_cancellation_until,
+          offerInput.deposit_percent, offerInput.balance_due_days_before_travel, offerInput.payment_notes,
+          offerInput.room_count ?? null, offerInput.taxes_included ?? null, offerInput.availability_confirmed ?? null],
       );
+      await replaceLineItems(client, oldOffer.id, offerInput.line_items ?? [], randomUUID);
+      const lineItems = await loadLineItems(client, [oldOffer.id]);
       await notify(client, oldOffer.agency_organization_id, 'offer_revised', 'Seller revised an offer', `${oldOffer.request_id} / ${request.auth.organization_name}`, { offerId: oldOffer.id, requestId: oldOffer.request_id });
       await client.query('COMMIT');
-      return response.json({ offer: { id: revised.rows[0].id, requestId: revised.rows[0].request_id, kind: revised.rows[0].offer_kind, totalMinor: revised.rows[0].total_minor, ratePerNightMinor: revised.rows[0].rate_per_night_minor, roomType: revised.rows[0].room_type, currency: revised.rows[0].currency, inclusions: revised.rows[0].inclusions, exclusions: revised.rows[0].exclusions, mealPlan: revised.rows[0].meal_plan, cancellationPolicy: revised.rows[0].cancellation_policy, validityUntil: revised.rows[0].validity_until, status: revised.rows[0].status } });
+      return response.json({ offer: offerDto(revised.rows[0], { lineItems: lineItems.get(oldOffer.id), request: requestFacts }) });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       return next(error);
@@ -820,7 +862,7 @@ export function createMarketplaceRouter({ pool }) {
     }
   });
 
-  router.post('/offers/:offerId/withdraw', async (request, response, next) => {
+  router.post('/offers/:offerId/withdraw', requireCapability(capabilities.offerWrite), async (request, response, next) => {
     if (!['dmc', 'hotelier'].includes(request.auth.business_type)) return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the seller can withdraw its offer.');
     try {
       const result = await pool.query(
@@ -888,7 +930,7 @@ export function createMarketplaceRouter({ pool }) {
     }
   });
 
-  router.post('/requests/:requestId/award', async (request, response, next) => {
+  router.post('/requests/:requestId/award', requireCapability(capabilities.requestAward), async (request, response, next) => {
     if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the requesting agency can award an offer.');
     const offerId = typeof request.body?.offer_id === 'string' ? request.body.offer_id : '';
     if (!/^[0-9a-f-]{36}$/i.test(offerId)) return fail(response, 400, 'VALIDATION_ERROR', 'Choose an offer to award.');
@@ -945,15 +987,49 @@ export function createMarketplaceRouter({ pool }) {
       const result = await pool.query(
         `SELECT a.id, a.request_id, r.request_code, r.destination, a.offer_id, a.status,
                 a.created_at, a.booking_confirmed_at, a.agency_organization_id,
-                a.seller_organization_id, o.name AS seller_name
+                a.seller_organization_id, o.name AS seller_name,
+                (g.award_id IS NOT NULL AND g.revoked_at IS NULL AND g.purged_at IS NULL) AS guest_details_released
          FROM awards a JOIN marketplace_requests r ON r.id = a.request_id
-         JOIN organizations o ON o.id = a.seller_organization_id WHERE a.id = $1`,
+         JOIN organizations o ON o.id = a.seller_organization_id
+         LEFT JOIN booking_guest_details g ON g.award_id = a.id WHERE a.id = $1`,
         [request.params.awardId],
       );
       const award = result.rows[0];
       if (!award || (award.agency_organization_id !== request.auth.organization_id && award.seller_organization_id !== request.auth.organization_id)) return fail(response, 404, 'AWARD_NOT_FOUND', 'Award was not found.');
-      return response.json({ award: { id: award.id, requestId: award.request_id, requestCode: award.request_code, destination: award.destination, offerId: award.offer_id, sellerName: award.seller_name, status: award.status, createdAt: award.created_at, bookingConfirmedAt: award.booking_confirmed_at, guestDetailsReleased: false } });
+      return response.json({ award: { id: award.id, requestId: award.request_id, requestCode: award.request_code, destination: award.destination, offerId: award.offer_id, sellerName: award.seller_name, status: award.status, createdAt: award.created_at, bookingConfirmedAt: award.booking_confirmed_at, guestDetailsReleased: Boolean(award.guest_details_released) } });
     } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.post('/reports', reportLimiter, async (request, response, next) => {
+    const input = parseWith(reportSchema, request.body);
+    if (input.error) return fail(response, 400, 'VALIDATION_ERROR', input.error);
+    const { target_type: targetType, target_id: targetId, category, details } = input.data;
+    if (containsContactDetails(details)) return fail(response, 400, 'CONTACT_DETAILS_NOT_ALLOWED', 'Describe the problem without contact details or links; operations can see the reported item.');
+    const me = request.auth.organization_id;
+    const targetQueries = {
+      request: [`SELECT r.agency_organization_id AS target_organization_id FROM request_targets t
+        JOIN marketplace_requests r ON r.id = t.request_id WHERE r.id = $1 AND t.seller_organization_id = $2`, [targetId, me]],
+      offer: [`SELECT f.seller_organization_id AS target_organization_id FROM offers f
+        JOIN marketplace_requests r ON r.id = f.request_id WHERE f.id = $1 AND r.agency_organization_id = $2`, [targetId, me]],
+      message: ['SELECT sender_organization_id AS target_organization_id FROM request_messages WHERE id = $1 AND recipient_organization_id = $2', [targetId, me]],
+      organization: [`SELECT $1::uuid AS target_organization_id WHERE $1::uuid <> $2::uuid AND EXISTS (
+        SELECT 1 FROM request_targets t JOIN marketplace_requests r ON r.id = t.request_id
+        WHERE (r.agency_organization_id = $2 AND t.seller_organization_id = $1) OR (r.agency_organization_id = $1 AND t.seller_organization_id = $2))`, [targetId, me]],
+    };
+    try {
+      const [sql, params] = targetQueries[targetType];
+      const target = await pool.query(sql, params);
+      if (!target.rowCount) return fail(response, 404, 'REPORT_TARGET_NOT_FOUND', 'You can only report items your organization has taken part in.');
+      const created = await pool.query(
+        `INSERT INTO abuse_reports (id, reporter_organization_id, reporter_user_id, target_type, target_id, target_organization_id, category, details)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, status, created_at`,
+        [randomUUID(), me, request.auth.user_id, targetType, targetId, target.rows[0].target_organization_id, category, details],
+      );
+      return response.status(201).json({ report: { id: created.rows[0].id, status: created.rows[0].status, createdAt: created.rows[0].created_at } });
+    } catch (error) {
+      if (error.code === '23505') return fail(response, 409, 'REPORT_ALREADY_OPEN', 'Your organization already has an open report for this item.');
       return next(error);
     }
   });

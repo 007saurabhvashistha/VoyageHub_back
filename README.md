@@ -30,10 +30,14 @@ Marketplace rules (migration 012): requests can be `open`, `invite_only` or `ope
 
 Without an email provider, an operator with database access can mark a registered account verified with `npm run account:verify -- owner@example.com`.
 
+Signed webhooks (migration 018): owners and managers add HTTPS endpoints under Integrations (`/v1/webhooks`), choose event types from `/v1/reference-data` (`webhookEventTypes`), and receive Standard Webhooks-signed POSTs written in the same transaction as the in-app notification. Secrets are shown once, stored encrypted with `WEBHOOK_SECRET_ENCRYPTION_KEY`, and can be rotated with a grace period. Deliveries retry with backoff, dead-letter, can be retried manually, and endpoints are disabled after repeated failures. Private and reserved IP addresses are refused at connect time.
+
+Operations: `npm run db:backup [-- --upload]` writes a consistent `pg_dump` plus manifest; `npm run db:restore-drill` restores it into an empty scratch database (`RESTORE_DRILL_DATABASE_URL`) and verifies every table's row count, migrations and triggers. Both record results in `operation_runs`, shown to admins at `GET /v1/admin/operations`. Runbooks are in [docs/runbooks](docs/runbooks/README.md).
+
 ## Verify
 
 ```powershell
 npm test
 ```
 
-This is a working private MVP slice, not production launch readiness. Email verification/recovery workflows and MFA are implemented, but real email delivery and the MFA encryption key must be configured before use. SSO, KYC evidence upload and retention, verified booking confirmation and scoped guest-data release, and CRM integrations remain. Do not put credentials in source control; local environment files and embedded data are ignored.
+This is a working private MVP slice, not production launch readiness. Email verification/recovery workflows and MFA are implemented, but real email delivery and the MFA encryption key must be configured before use. Seller verification documents need private storage (`STORAGE_PROVIDER=s3|azure`) and a ClamAV scanner (`MALWARE_SCANNER=clamav`); see `.env.example`. SSO, agency verification documents, a public API for CRMs (webhooks are done), a load test, and a re-encryption command for the MFA and guest-data keys remain. Do not put credentials in source control; local environment files and embedded data are ignored.

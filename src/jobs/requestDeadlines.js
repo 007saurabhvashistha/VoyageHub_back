@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { config } from '../config/index.js';
 
 async function notify(client, organizationId, eventType, title, message, data) {
   await client.query(
@@ -55,7 +56,7 @@ export async function processRequestDeadlines(pool, { now = () => new Date(), ba
   }
 }
 
-export function startRequestDeadlineWorker(pool, { intervalMs = 60000, logger = console } = {}) {
+export function startRequestDeadlineWorker(pool, { intervalMs = config.deadlineJobIntervalMs, logger = console } = {}) {
   let active = false;
   let stopped = false;
   const run = async () => {

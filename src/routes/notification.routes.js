@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { loadSession, requireCsrf, requireMfaForPlatformAdmin } from './auth.routes.js';
+import { loadSession, requireActiveAccount, requireCsrf, requireMfaForPlatformAdmin } from './auth.routes.js';
 
 function fail(response, status, code, message) {
   return response.status(status).json({ error: { code, message } });
@@ -9,6 +9,7 @@ export function createNotificationRouter({ pool }) {
   const router = Router();
   router.use((request, response, next) => loadSession(pool, request, response, next));
   router.use(requireMfaForPlatformAdmin);
+  router.use((request, response, next) => requireActiveAccount(pool, request, response, next));
 
   router.get('/', async (request, response, next) => {
     const requestedLimit = Number(request.query.limit ?? 50);

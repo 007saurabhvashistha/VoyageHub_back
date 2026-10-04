@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { PGlite } from '@electric-sql/pglite';
@@ -9,7 +9,7 @@ import { createApp } from '../src/app.js';
 import { EmbeddedPostgresPool } from '../src/db/embeddedPool.js';
 import { decryptEmailActionToken } from '../src/utils/emailActionTokens.js';
 
-const migrationNames = ['001_identity.sql', '002_marketplace.sql', '003_platform_admin.sql', '004_hotel_offers.sql', '005_notifications.sql', '006_offer_revisions.sql', '007_seller_profile_changes.sql', '008_request_messages.sql', '009_notification_outbox.sql', '010_email_verification_and_recovery.sql', '011_multi_factor_auth.sql', '012_marketplace_rules.sql'];
+const migrationNames = (await readdir(fileURLToPath(new URL('../db/migrations/', import.meta.url)))).filter((name) => name.endsWith('.sql')).sort();
 const migrations = await Promise.all(migrationNames.map(async (name) => {
   const migrationUrl = new URL(`../db/migrations/${name}`, import.meta.url);
   return readFile(fileURLToPath(migrationUrl), 'utf8');
