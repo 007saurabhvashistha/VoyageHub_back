@@ -24,7 +24,7 @@ export function registerOperationsAdminRoutes(router, pool) {
         ),
       ]);
       const now = Date.now();
-      const checks = operationRunKinds.map(({ value, label }) => {
+      const checks = operationRunKinds.filter((kind) => kind.monitored).map(({ value, label }) => {
         const lastSuccess = latest.rows.find((row) => row.kind === value && row.status === 'succeeded');
         const lastFailure = latest.rows.find((row) => row.kind === value && row.status === 'failed');
         const maxAgeMs = value === 'database_backup' ? config.operations.backupMaxAgeHours * 3600000 : config.operations.restoreDrillMaxAgeDays * 86400000;

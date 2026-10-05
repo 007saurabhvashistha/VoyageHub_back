@@ -4,14 +4,16 @@ import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import { config, isCountryCode } from '../config/index.js';
 import { createRateLimiter } from '../utils/rateLimit.js';
-import { businessTypes, capabilities } from '../config/referenceData.js';
+import { businessTypes, capabilities, coverageModes } from '../config/referenceData.js';
 import { capabilitiesFor, requireCapability } from '../services/permissions.js';
 import { recordOrganizationEvent } from '../services/organizationAudit.js';
 import { parseWith } from '../utils/validation.js';
 import { encryptEmailActionToken, hashEmailActionToken } from '../utils/emailActionTokens.js';
 import { decryptSecret, encryptSecret } from '../utils/encryption.js';
 import { createRecoveryCodes, createTotpEnrollment, decryptTotpSecret, hashRecoveryCode, hashTotpCode, normalizeRecoveryCode, verifyTotpCode } from '../services/totp.js';
-import { loadCoverage, replaceCoverage, resolveActiveDestinations, sellerProfileResponse } from '../services/destinations.js';
+import { loadCoverage, normalizeCoverageRules, replaceCoverage, resolveActiveDestinations, sellerProfileResponse } from '../services/destinations.js';
+import { propertyDestinationKinds } from '../services/hotelProperties.js';
+import { routingDeclinePrefix } from '../services/routing.js';
 import { legalDocumentDto, missingAcceptances, pendingLegalDocuments, recordAcceptances } from '../services/legal.js';
 
 const allowedBusinessTypes = new Set(businessTypes.map((type) => type.value));
@@ -233,7 +235,7 @@ function validRegistration(body) {
   };
 }
 
-export function createAuthRouter({ pool, secureCookies, cookieName, emailDelivery = null, tokenEncryptionKey = null, mfaEncryptionKey = null }) {
+export function createAuthRouter({ pool, secureCookies, cookieName, emailDelivery = null, tokenEncryptionKey = null, mfaEncryptionKey = null, emailVerificationRequired = config.emailVerificationRequired }) {
   const router = Router();
   const authLimiter = createRateLimiter(config.rateLimits.auth, 'Too many attempts. Try again later.');
   const loginLimiter = createRateLimiter(config.rateLimits.auth, 'Too many failed sign-in attempts. Try again later.', { skipSuccessfulRequests: true });
@@ -244,7 +246,7 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
     const input = validRegistration(request.body ?? {});
     if (input.error) return apiError(response, 400, 'VALIDATION_ERROR', input.error);
     if (!pool) return apiError(response, 503, 'DATABASE_NOT_CONFIGURED', 'Account service is unavailable until the database is configured.');
-    if (!tokenEncryptionKey) return apiError(response, 503, 'EMAIL_SECURITY_NOT_CONFIGURED', 'Email verification cannot be started until the email-token encryption key is configured.');
+    if (emailVerificationRequired && !tokenEncryptionKey) return apiError(response, 503, 'EMAIL_SECURITY_NOT_CONFIGURED', 'Email verification cannot be started until the email-token encryption key is configured.');
 
     const client = await pool.connect();
     try {
@@ -252,7 +254,7 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
       if (missing.length) return apiError(response, 400, 'LEGAL_ACCEPTANCE_REQUIRED', `Accept the current ${missing.map((row) => row.title).join(', ')} to create an account.`);
       const coverage = await resolveActiveDestinations(client, input.coverageDestinationIds);
       if (coverage.error) return apiError(response, 400, 'VALIDATION_ERROR', coverage.error);
-      const property = await resolveActiveDestinations(client, input.propertyDestinationId ? [input.propertyDestinationId] : [], { kinds: ['city'] });
+      const property = await resolveActiveDestinations(client, input.propertyDestinationId ? [input.propertyDestinationId] : [], { kinds: propertyDestinationKinds });
       if (property.error) return apiError(response, 400, 'VALIDATION_ERROR', property.error);
       const passwordHash = await bcrypt.hash(input.password, passwordWorkFactor);
       const organizationId = randomUUID();
@@ -263,8 +265,8 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
         [organizationId, input.organizationName, input.businessType, input.countryCode],
       );
       await client.query(
-        'INSERT INTO users (id, full_name, email, password_hash) VALUES ($1, $2, $3, $4)',
-        [userId, input.fullName, input.email, passwordHash],
+        'INSERT INTO users (id, full_name, email, password_hash, email_verified_at) VALUES ($1, $2, $3, $4, CASE WHEN $5 THEN NULL ELSE NOW() END)',
+        [userId, input.fullName, input.email, passwordHash, emailVerificationRequired],
       );
       await client.query(
         "INSERT INTO organization_memberships (id, organization_id, user_id, access_role) VALUES ($1, $2, $3, 'owner')",
@@ -276,15 +278,21 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
           [organizationId, input.propertyDestinationId],
         );
         await replaceCoverage(client, organizationId, input.coverageDestinationIds);
+        if (input.propertyDestinationId) {
+          await client.query(
+            'INSERT INTO hotel_properties (id, organization_id, name, destination_id) VALUES ($1, $2, $3, $4)',
+            [randomUUID(), organizationId, input.organizationName, input.propertyDestinationId],
+          );
+        }
       }
       await recordAcceptances(client, { userId, organizationId, documentIds: input.acceptedLegalDocumentIds });
-      await queueEmailAction(client, { userId, organizationId, purpose: 'verify_email', tokenEncryptionKey });
+      if (emailVerificationRequired) await queueEmailAction(client, { userId, organizationId, purpose: 'verify_email', tokenEncryptionKey });
       await client.query('COMMIT');
       return response.status(201).json({
         user: { id: userId, fullName: input.fullName, email: input.email, isPlatformAdmin: false },
         organization: { id: organizationId, name: input.organizationName, businessType: input.businessType, countryCode: input.countryCode },
-        verificationRequired: true,
-        emailDeliveryStatus: emailDelivery ? 'queued' : 'blocked_config',
+        verificationRequired: emailVerificationRequired,
+        emailDeliveryStatus: emailVerificationRequired ? (emailDelivery ? 'queued' : 'blocked_config') : 'not_required',
       });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
@@ -794,6 +802,10 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
 
   const profileSchema = z.object({
     coverage_destination_ids: registrationExtrasSchema.shape.coverage_destination_ids,
+    coverage: z.array(z.object({
+      destination_id: destinationIdSchema,
+      mode: z.enum(coverageModes.map((mode) => mode.value)).default('include'),
+    })).max(config.maxCoverageDestinations, `Choose up to ${config.maxCoverageDestinations} coverage rules.`).optional(),
     property_destination_id: destinationIdSchema.nullish(),
   });
 
@@ -802,15 +814,20 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
     const input = parseWith(profileSchema, request.body);
     if (input.error) return apiError(response, 400, 'VALIDATION_ERROR', input.error);
     const isDmc = request.auth.business_type === 'dmc';
-    const coverageIds = isDmc ? input.data.coverage_destination_ids : [];
+    const coverageRules = isDmc
+      ? normalizeCoverageRules(input.data.coverage
+        ? input.data.coverage.map((rule) => ({ destinationId: rule.destination_id, mode: rule.mode }))
+        : input.data.coverage_destination_ids)
+      : [];
+    const coverageIds = coverageRules.map((rule) => rule.destinationId);
     const propertyDestinationId = isDmc ? null : input.data.property_destination_id ?? null;
-    if (isDmc && coverageIds.length === 0) return apiError(response, 400, 'VALIDATION_ERROR', 'Add at least one destination to your coverage.');
+    if (isDmc && !coverageRules.some((rule) => rule.mode === 'include')) return apiError(response, 400, 'VALIDATION_ERROR', 'Add at least one destination to your coverage.');
     if (!isDmc && !propertyDestinationId) return apiError(response, 400, 'VALIDATION_ERROR', 'Choose the city where your property is located.');
     const client = await pool.connect();
     try {
       const coverage = await resolveActiveDestinations(client, coverageIds);
       if (coverage.error) return apiError(response, 400, 'VALIDATION_ERROR', coverage.error);
-      const property = await resolveActiveDestinations(client, propertyDestinationId ? [propertyDestinationId] : [], { kinds: ['city'] });
+      const property = await resolveActiveDestinations(client, propertyDestinationId ? [propertyDestinationId] : [], { kinds: propertyDestinationKinds });
       if (property.error) return apiError(response, 400, 'VALIDATION_ERROR', property.error);
       await client.query('BEGIN');
       const current = await client.query(
@@ -823,12 +840,12 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
       }
       const previousCoverage = await loadCoverage(client, request.auth.organization_id);
       const previousProfile = {
-        coverageDestinationIds: previousCoverage.map((row) => row.id).sort(),
+        coverageDestinationIds: previousCoverage.map((row) => `${row.id}:${row.mode}`).sort(),
         coverageDestinations: previousCoverage.map((row) => row.name),
         propertyDestinationId: current.rows[0].property_destination_id,
       };
       const updatedProfile = {
-        coverageDestinationIds: [...coverageIds].sort(),
+        coverageDestinationIds: coverageRules.map((rule) => `${rule.destinationId}:${rule.mode}`).sort(),
         coverageDestinations: coverage.rows.map((row) => row.name),
         propertyDestinationId,
         propertyCity: property.rows[0]?.name ?? null,
@@ -851,7 +868,14 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
          WHERE organization_id = $1`,
         [request.auth.organization_id, updatedProfile.propertyDestinationId, updatedProfile.propertyCity],
       );
-      await replaceCoverage(client, request.auth.organization_id, coverageIds);
+      await replaceCoverage(client, request.auth.organization_id, coverageRules);
+      if (!isDmc && previousProfile.propertyDestinationId !== updatedProfile.propertyDestinationId) {
+        await client.query(
+          `UPDATE hotel_properties SET destination_id = $2, verification_status = 'pending', updated_at = NOW()
+           WHERE id = (SELECT id FROM hotel_properties WHERE organization_id = $1 ORDER BY created_at, id LIMIT 1)`,
+          [request.auth.organization_id, updatedProfile.propertyDestinationId],
+        );
+      }
       const withdrawn = await client.query(
         `UPDATE offers offer SET status = 'withdrawn', updated_at = NOW()
          FROM marketplace_requests request WHERE offer.request_id = request.id
@@ -868,10 +892,10 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
         );
       }
       await client.query(
-        `UPDATE request_targets SET declined_at = NOW(), decline_reason = 'Seller profile changed; re-evaluation required.'
+        `UPDATE request_targets SET declined_at = NOW(), decline_reason = $2
          WHERE seller_organization_id = $1 AND declined_at IS NULL
            AND request_id IN (SELECT id FROM marketplace_requests WHERE status = 'open')`,
-        [request.auth.organization_id],
+        [request.auth.organization_id, `${routingDeclinePrefix} Seller profile changed; re-evaluation required.`],
       );
       await client.query('COMMIT');
       return response.json({ ...(await sellerProfileResponse(client, request.auth.organization_id)), changed: true });

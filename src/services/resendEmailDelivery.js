@@ -1,4 +1,4 @@
-import { decryptEmailActionToken } from '../utils/emailActionTokens.js';
+import { buildEmailActionMessage } from './emailActionMessage.js';
 
 function providerError(code, retryable) {
   return Object.assign(new Error('Email provider request failed.'), { code, retryable });
@@ -23,22 +23,7 @@ export function createResendEmailDelivery({
   }
 
   return async ({ idempotencyKey, recipientEmail, notification }) => {
-    let text = notification.message;
-    const actionTokenId = notification.data?.authEmailTokenId;
-    if (actionTokenId) {
-      const action = await pool.query(
-        'SELECT purpose, token_ciphertext, expires_at FROM auth_email_tokens WHERE id = $1 AND used_at IS NULL',
-        [actionTokenId],
-      );
-      if (!action.rowCount || !action.rows[0].token_ciphertext || new Date(action.rows[0].expires_at) <= new Date()) {
-        throw providerError('email_action_token_unavailable', false);
-      }
-      const token = decryptEmailActionToken(action.rows[0].token_ciphertext, tokenEncryptionKey);
-      const route = action.rows[0].purpose === 'verify_email' ? 'verify-email' : 'reset-password';
-      const link = new URL(`/${route}`, baseUrl);
-      link.searchParams.set('token', token);
-      text = `${text}\n\n${link.toString()}\n\nThis link expires soon and can be used once.`;
-    }
+    const email = await buildEmailActionMessage({ pool, tokenEncryptionKey, appBaseUrl: baseUrl, recipientEmail, notification });
 
     let response;
     try {
@@ -49,7 +34,7 @@ export function createResendEmailDelivery({
           'content-type': 'application/json',
           'idempotency-key': idempotencyKey,
         },
-        body: JSON.stringify({ from, to: [recipientEmail], subject: notification.title, text }),
+        body: JSON.stringify({ from, ...email, to: [email.to] }),
         signal: AbortSignal.timeout(10000),
       });
     } catch {

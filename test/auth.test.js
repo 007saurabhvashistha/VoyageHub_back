@@ -6,6 +6,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { generate } from 'otplib';
 import test from 'node:test';
 import { createApp } from '../src/app.js';
+import { loadConfig } from '../src/config/index.js';
 import { EmbeddedPostgresPool } from '../src/db/embeddedPool.js';
 import { decryptEmailActionToken } from '../src/utils/emailActionTokens.js';
 
@@ -17,12 +18,12 @@ const migrations = await Promise.all(migrationNames.map(async (name) => {
 const tokenEncryptionKey = Buffer.alloc(32, 17);
 const mfaEncryptionKey = Buffer.alloc(32, 23);
 
-async function startIdentityApp(context) {
+async function startIdentityApp(context, { emailVerificationRequired = true, testTokenKey = tokenEncryptionKey } = {}) {
   const database = new PGlite();
   await database.waitReady;
   const pool = new EmbeddedPostgresPool(database);
   for (const migration of migrations) await pool.exec(migration);
-  const server = createApp({ pool, secureCookies: false, emailDelivery: async () => {}, tokenEncryptionKey, mfaEncryptionKey }).listen(0, '127.0.0.1');
+  const server = createApp({ pool, secureCookies: false, emailDelivery: async () => {}, tokenEncryptionKey: testTokenKey, mfaEncryptionKey, emailVerificationRequired }).listen(0, '127.0.0.1');
   await once(server, 'listening');
   context.after(async () => {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -64,6 +65,11 @@ const registration = {
   business_type: 'agency',
   password: 'correct-horse-2026',
 };
+
+test('email verification is required by default and can be disabled by configuration', () => {
+  assert.equal(loadConfig({}).emailVerificationRequired, true);
+  assert.equal(loadConfig({ EMAIL_VERIFICATION_REQUIRED: 'false' }).emailVerificationRequired, false);
+});
 
 test('registration persists an unverified account without issuing a session, then verification allows login', async (context) => {
   const { pool, baseUrl } = await startIdentityApp(context);
@@ -323,4 +329,27 @@ test('platform admins must enroll MFA; TOTP challenges reject replay and recover
   assert.equal(reusedRecovery.status, 401);
   const replacementRecovery = await completeChallenge(reusedRecoveryChallenge, rotatedCodes[0]);
   assert.equal(replacementRecovery.status, 200);
+});
+
+test('registration can skip email verification when explicitly disabled', async (context) => {
+  const { pool, baseUrl } = await startIdentityApp(context, { emailVerificationRequired: false, testTokenKey: null });
+  const response = await fetch(`${baseUrl}/v1/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(registration),
+  });
+
+  assert.equal(response.status, 201);
+  const body = await response.json();
+  assert.equal(body.verificationRequired, false);
+  assert.equal(body.emailDeliveryStatus, 'not_required');
+  assert.ok((await pool.query('SELECT email_verified_at FROM users WHERE id = $1', [body.user.id])).rows[0].email_verified_at);
+  assert.equal((await pool.query("SELECT COUNT(*)::int AS count FROM notification_outbox WHERE recipient_user_id = $1 AND event_type = 'email_verification'", [body.user.id])).rows[0].count, 0);
+
+  const login = await fetch(`${baseUrl}/v1/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email: registration.email, password: registration.password, business_type: 'agency' }),
+  });
+  assert.equal(login.status, 200);
 });

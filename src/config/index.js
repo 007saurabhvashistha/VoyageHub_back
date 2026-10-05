@@ -19,10 +19,16 @@ const positiveInt = (fallback) => z.coerce.number().int().positive().default(fal
 const optionalText = (max) => z.string().trim().min(1).max(max).optional();
 const mimeTypeList = z.string().transform((value) => value.split(',').map((item) => item.trim().toLowerCase()).filter(Boolean))
   .pipe(z.array(z.string().regex(/^[a-z]+\/[a-z0-9.+-]+$/, 'DOCUMENT_ALLOWED_MIME_TYPES must be a comma-separated list of MIME types')).min(1));
+const textList = (pattern, message) => z.string().transform((value) => value.split(',').map((item) => item.trim()).filter(Boolean))
+  .pipe(z.array(z.string().regex(pattern, message)));
 
 const envSchema = z.object({
+  EMAIL_VERIFICATION_REQUIRED: z.stringbool().default(true),
   DEFAULT_COUNTRY: z.string().toUpperCase().refine(isCountryCode, 'DEFAULT_COUNTRY must be an ISO 3166-1 alpha-2 code').default('IN'),
   DEFAULT_CURRENCY: z.string().toUpperCase().refine(isCurrencyCode, 'DEFAULT_CURRENCY must be an ISO 4217 code').default('INR'),
+  COMPARISON_RATE_API_URL: z.url().refine((value) => new URL(value).protocol === 'https:', 'COMPARISON_RATE_API_URL must use HTTPS').default('https://api.frankfurter.dev/v2'),
+  COMPARISON_RATE_TIMEOUT_MS: positiveInt(5000),
+  COMPARISON_RATE_CACHE_SECONDS: positiveInt(3600),
   MAX_INVITED_SUPPLIERS: positiveInt(20),
   REQUEST_DEADLINE_MIN_HOURS: positiveInt(1),
   REQUEST_DEADLINE_DEFAULT_HOURS: positiveInt(72),
@@ -53,6 +59,7 @@ const envSchema = z.object({
   MFA_CHALLENGE_TTL_MINUTES: positiveInt(5),
   MAX_COVERAGE_DESTINATIONS: positiveInt(20),
   DESTINATION_SEARCH_LIMIT: positiveInt(20),
+  DESTINATION_CHILDREN_LIMIT: positiveInt(500),
   DESTINATION_SEARCH_RATE_LIMIT_PER_MINUTE: positiveInt(120),
   ACCOUNT_DELETION_GRACE_DAYS: positiveInt(30),
   UNVERIFIED_ACCOUNT_RETENTION_DAYS: positiveInt(30),
@@ -60,6 +67,22 @@ const envSchema = z.object({
   ACCOUNT_EXPORT_RATE_LIMIT_PER_HOUR: positiveInt(5),
   GEONAMES_DUMP_URL: z.url().default('https://download.geonames.org/export/dump'),
   GEONAMES_CITIES_DATASET: z.enum(['cities500', 'cities1000', 'cities5000', 'cities15000']).default('cities15000'),
+  // Defaults for admin-editable platform settings; the database value wins once an admin sets it.
+  DESTINATION_COUNTRIES: textList(/^[A-Z]{2}$/, 'DESTINATION_COUNTRIES must be comma-separated ISO country codes').default([]),
+  GEONAMES_PLACE_FEATURE_CODES: textList(/^[A-Z0-9]{1,10}$/, 'GEONAMES_PLACE_FEATURE_CODES must be comma-separated GeoNames feature codes')
+    .default(['PRK', 'RES', 'RESN', 'RESW', 'LK', 'ISL', 'PASS', 'BCH', 'WTRF', 'ANS', 'MNMT', 'FT', 'CSTL', 'PAL', 'CAVE', 'VAL', 'HSTS']),
+  GEONAMES_ALIAS_LANGUAGES: textList(/^[a-z]{0,8}$/, 'GEONAMES_ALIAS_LANGUAGES must be comma-separated language codes').default(['en', 'abbr']),
+  GEONAMES_EXCLUDED_FEATURE_CODES: textList(/^[A-Z0-9]{1,10}$/, 'GEONAMES_EXCLUDED_FEATURE_CODES must be comma-separated GeoNames feature codes').default(['PPLX', 'PPLH', 'PPLQ', 'PPLW', 'PPLCH']),
+  GEONAMES_MIN_PLACE_POPULATION: z.coerce.number().int().min(0).default(5000),
+  GEONAMES_MAX_ALIASES: positiveInt(15),
+  HOTEL_LEAD_ALLOWED_DESTINATION_KINDS: textList(/^(region|district|city)$/, 'HOTEL_LEAD_ALLOWED_DESTINATION_KINDS may contain region, district and city').default(['region', 'district', 'city']),
+  MAX_REQUEST_DESTINATIONS: positiveInt(10),
+  MAX_OFFERS_PER_HOTEL_ORG_PER_REQUEST: positiveInt(3),
+  MAX_INSTANT_ALERTS_PER_REQUEST: positiveInt(200),
+  DIGEST_SEND_HOUR_UTC: z.coerce.number().int().min(0).max(23).default(3),
+  MAX_HOTEL_PROPERTIES_PER_ORGANIZATION: positiveInt(100),
+  ALERT_DIGEST_JOB_INTERVAL_SECONDS: positiveInt(600),
+  FEATURED_IMPORT_MAX_ROWS: positiveInt(2000),
   LEGAL_ENTITY_NAME: optionalText(200),
   GRIEVANCE_OFFICER_NAME: optionalText(120),
   GRIEVANCE_OFFICER_EMAIL: z.email().optional(),
@@ -158,8 +181,14 @@ export function loadConfig(env = process.env) {
     throw new Error('WEBHOOK_ALLOW_INSECURE_URLS must not be enabled in production.');
   }
   return {
+    emailVerificationRequired: parsed.EMAIL_VERIFICATION_REQUIRED,
     defaultCountry: parsed.DEFAULT_COUNTRY,
     defaultCurrency: parsed.DEFAULT_CURRENCY,
+    comparisonRates: {
+      apiUrl: parsed.COMPARISON_RATE_API_URL.replace(/\/+$/, ''),
+      timeoutMs: parsed.COMPARISON_RATE_TIMEOUT_MS,
+      cacheMs: parsed.COMPARISON_RATE_CACHE_SECONDS * 1000,
+    },
     maxInvitedSuppliers: parsed.MAX_INVITED_SUPPLIERS,
     requestDeadline: {
       minHours: parsed.REQUEST_DEADLINE_MIN_HOURS,
@@ -253,12 +282,32 @@ export function loadConfig(env = process.env) {
     mfaChallengeTtlMs: parsed.MFA_CHALLENGE_TTL_MINUTES * 60000,
     maxCoverageDestinations: parsed.MAX_COVERAGE_DESTINATIONS,
     destinationSearchLimit: parsed.DESTINATION_SEARCH_LIMIT,
+    destinationChildrenLimit: parsed.DESTINATION_CHILDREN_LIMIT,
     retention: {
       accountDeletionGraceDays: parsed.ACCOUNT_DELETION_GRACE_DAYS,
       unverifiedAccountDays: parsed.UNVERIFIED_ACCOUNT_RETENTION_DAYS,
       intervalMs: parsed.RETENTION_JOB_INTERVAL_SECONDS * 1000,
     },
-    geonames: { dumpUrl: parsed.GEONAMES_DUMP_URL.replace(/\/$/, ''), citiesDataset: parsed.GEONAMES_CITIES_DATASET },
+    geonames: {
+      dumpUrl: parsed.GEONAMES_DUMP_URL.replace(/\/$/, ''),
+      citiesDataset: parsed.GEONAMES_CITIES_DATASET,
+      placeFeatureCodes: parsed.GEONAMES_PLACE_FEATURE_CODES,
+      aliasLanguages: parsed.GEONAMES_ALIAS_LANGUAGES,
+      excludedFeatureCodes: parsed.GEONAMES_EXCLUDED_FEATURE_CODES,
+      minPlacePopulation: parsed.GEONAMES_MIN_PLACE_POPULATION,
+      maxAliases: parsed.GEONAMES_MAX_ALIASES,
+    },
+    routing: {
+      destinationCountries: parsed.DESTINATION_COUNTRIES,
+      hotelLeadAllowedDestinationKinds: parsed.HOTEL_LEAD_ALLOWED_DESTINATION_KINDS,
+      maxRequestDestinations: parsed.MAX_REQUEST_DESTINATIONS,
+      maxOffersPerHotelOrgPerRequest: parsed.MAX_OFFERS_PER_HOTEL_ORG_PER_REQUEST,
+      maxInstantAlertsPerRequest: parsed.MAX_INSTANT_ALERTS_PER_REQUEST,
+      digestSendHourUtc: parsed.DIGEST_SEND_HOUR_UTC,
+      maxHotelPropertiesPerOrganization: parsed.MAX_HOTEL_PROPERTIES_PER_ORGANIZATION,
+      digestIntervalMs: parsed.ALERT_DIGEST_JOB_INTERVAL_SECONDS * 1000,
+      featuredImportMaxRows: parsed.FEATURED_IMPORT_MAX_ROWS,
+    },
     legal: {
       entityName: parsed.LEGAL_ENTITY_NAME ?? null,
       grievanceOfficer: parsed.GRIEVANCE_OFFICER_NAME && parsed.GRIEVANCE_OFFICER_EMAIL

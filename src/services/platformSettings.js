@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { config } from '../config/index.js';
+import { config, isCountryCode } from '../config/index.js';
+import { destinationKinds } from '../config/referenceData.js';
+
+const nonCountryKinds = destinationKinds.filter((kind) => kind.value !== 'country');
 
 // Admin-changeable settings; the config value is the default until an admin overrides it.
 export const platformSettingDefinitions = {
@@ -60,11 +63,108 @@ export const platformSettingDefinitions = {
     max: 3650,
     defaultValue: () => config.bookings.guestData.retentionDays,
   },
+  destination_countries: {
+    label: 'Destination countries',
+    description: 'ISO country codes whose destinations are imported and offered in pickers.',
+    type: 'list',
+    item: 'country',
+    maxItems: 60,
+    defaultValue: () => config.routing.destinationCountries,
+  },
+  destination_place_feature_codes: {
+    label: 'Imported tourist feature codes',
+    description: 'GeoNames feature codes imported as places besides towns (parks, lakes, passes...).',
+    type: 'list',
+    item: 'code',
+    maxItems: 100,
+    defaultValue: () => config.geonames.placeFeatureCodes,
+  },
+  destination_alias_languages: {
+    label: 'Alias languages',
+    description: 'GeoNames alternate-name language codes kept as searchable aliases.',
+    type: 'list',
+    item: 'language',
+    maxItems: 20,
+    defaultValue: () => config.geonames.aliasLanguages,
+  },
+  destination_min_place_population: {
+    label: 'Minimum town population',
+    description: 'Towns below this population are not imported (tourist features are always imported).',
+    unit: 'people',
+    min: 0,
+    max: 10000000,
+    defaultValue: () => config.geonames.minPlacePopulation,
+  },
+  hotel_lead_allowed_destination_kinds: {
+    label: 'Hotel-only lead levels',
+    description: 'Destination levels an agency may choose for a hotel-only lead.',
+    type: 'list',
+    item: 'kind',
+    options: nonCountryKinds.map((kind) => kind.value),
+    maxItems: nonCountryKinds.length,
+    defaultValue: () => config.routing.hotelLeadAllowedDestinationKinds,
+  },
+  max_request_destinations: {
+    label: 'Stops per itinerary lead',
+    description: 'Maximum destinations (stops) on one itinerary lead.',
+    unit: 'stops',
+    min: 1,
+    max: 30,
+    defaultValue: () => config.routing.maxRequestDestinations,
+  },
+  max_offers_per_hotel_org_per_request: {
+    label: 'Hotel offers per account per lead',
+    description: 'A hotel account may send one offer per matching property, up to this number per lead.',
+    unit: 'offers',
+    min: 1,
+    max: 20,
+    defaultValue: () => config.routing.maxOffersPerHotelOrgPerRequest,
+  },
+  max_instant_alerts_per_request: {
+    label: 'Instant alerts per lead',
+    description: 'Sellers beyond this number get the lead in their daily digest instead of an instant alert.',
+    unit: 'alerts',
+    min: 1,
+    max: 100000,
+    defaultValue: () => config.routing.maxInstantAlertsPerRequest,
+  },
+  digest_send_hour_utc: {
+    label: 'Daily digest hour (UTC)',
+    description: 'Hour of the day, in UTC, when daily lead digests are sent.',
+    unit: 'hour',
+    min: 0,
+    max: 23,
+    defaultValue: () => config.routing.digestSendHourUtc,
+  },
+  max_hotel_properties_per_organization: {
+    label: 'Hotels per hotel account',
+    description: 'Maximum properties one hotel account can list.',
+    unit: 'hotels',
+    min: 1,
+    max: 5000,
+    defaultValue: () => config.routing.maxHotelPropertiesPerOrganization,
+  },
+};
+
+const listItemSchemas = {
+  country: z.string().trim().toUpperCase().refine(isCountryCode, 'Use ISO country codes.'),
+  code: z.string().trim().toUpperCase().regex(/^[A-Z0-9]{1,10}$/, 'Use GeoNames feature codes.'),
+  language: z.string().trim().toLowerCase().regex(/^[a-z]{0,8}$/, 'Use language codes.'),
 };
 
 export function settingSchema(key) {
   const definition = platformSettingDefinitions[key];
+  if (definition.type === 'list') {
+    const item = definition.item === 'kind' ? z.enum(definition.options) : listItemSchemas[definition.item];
+    return z.array(item).max(definition.maxItems).transform((values) => [...new Set(values)]);
+  }
   return z.coerce.number().int().min(definition.min).max(definition.max);
+}
+
+export function settingErrorMessage(key) {
+  const definition = platformSettingDefinitions[key];
+  if (definition.type === 'list') return `${definition.label} must be a list of up to ${definition.maxItems} valid values${definition.options ? ` (${definition.options.join(', ')})` : ''}.`;
+  return `${definition.label} must be a whole number from ${definition.min} to ${definition.max}.`;
 }
 
 export async function getSetting(db, key) {
@@ -87,9 +187,11 @@ export async function listSettings(db) {
       key,
       label: definition.label,
       description: definition.description,
-      unit: definition.unit,
-      min: definition.min,
-      max: definition.max,
+      type: definition.type ?? 'number',
+      options: definition.options ?? null,
+      unit: definition.unit ?? null,
+      min: definition.min ?? null,
+      max: definition.max ?? null,
       defaultValue: definition.defaultValue(),
       value: parsed.success ? parsed.data : definition.defaultValue(),
       updatedAt: parsed.success ? row.updated_at : null,

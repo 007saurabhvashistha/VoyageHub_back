@@ -26,14 +26,49 @@ export const mealPlans = [
 
 export const hotelCategories = [3, 4, 5].map((stars) => ({ value: stars, label: `${stars} star` }));
 
+// allowedFor: the requirement types a service may appear in; a hotel-only lead can ask only for hotel services.
 export const serviceTypes = [
-  { value: 'hotel', label: 'Hotel' },
-  { value: 'transfers', label: 'Transfers' },
-  { value: 'sightseeing', label: 'Sightseeing' },
-  { value: 'guide', label: 'Guide' },
-  { value: 'visa', label: 'Visa' },
-  { value: 'flights', label: 'Flights' },
+  { value: 'hotel', label: 'Hotel', allowedFor: ['hotel_only', 'itinerary'] },
+  { value: 'transfers', label: 'Transfers', allowedFor: ['itinerary'] },
+  { value: 'sightseeing', label: 'Sightseeing', allowedFor: ['itinerary'] },
+  { value: 'guide', label: 'Guide', allowedFor: ['itinerary'] },
+  { value: 'visa', label: 'Visa', allowedFor: ['itinerary'] },
+  { value: 'flights', label: 'Flights', allowedFor: ['itinerary'] },
 ];
+
+// audience: the only seller business type that may ever see a lead of this type.
+export const requirementTypes = [
+  { value: 'hotel_only', label: 'Hotel only', audience: 'hotelier', description: 'Only hotel owners in the chosen area see this lead.', maxDestinations: 1 },
+  { value: 'itinerary', label: 'Itinerary / package', audience: 'dmc', description: 'Only DMCs covering the chosen area see this lead.', maxDestinations: null },
+];
+
+export const coverageModes = [
+  { value: 'include', label: 'Covered' },
+  { value: 'exclude', label: 'Not covered' },
+];
+
+export const matchTypes = [
+  { value: 'full', label: 'Full coverage' },
+  { value: 'partial', label: 'Partial coverage' },
+  { value: 'invited', label: 'Invited' },
+];
+
+export const alertDeliveryModes = [
+  { value: 'instant', label: 'Instant alert' },
+  { value: 'digest', label: 'Daily digest' },
+  { value: 'off', label: 'No alerts (feed only)' },
+];
+
+export const hotelPropertyStatuses = [
+  { value: 'pending', label: 'Awaiting review' },
+  { value: 'approved', label: 'Approved' },
+  { value: 'rejected', label: 'Rejected' },
+];
+
+export const audienceFor = (requirementType) => requirementTypes.find((item) => item.value === requirementType)?.audience ?? null;
+
+// SQL CASE mapping a request's requirement type to its only eligible seller business type.
+export const requirementAudienceSql = (column) => `(CASE ${column} ${requirementTypes.map((item) => `WHEN '${item.value}' THEN '${item.audience}'`).join(' ')} END)`;
 
 export const offerInclusions = [
   { value: 'accommodation', label: 'Accommodation' },
@@ -119,11 +154,21 @@ export const reportCategories = [
   { value: 'other', label: 'Other' },
 ];
 
+// Generic labels; per-country wording (e.g. the local name of level 1) lives in country_destination_levels.
 export const destinationKinds = [
-  { value: 'country', label: 'Country' },
-  { value: 'region', label: 'State / region' },
-  { value: 'city', label: 'City' },
+  { value: 'country', label: 'Country', depth: 0 },
+  { value: 'region', label: 'Region', depth: 1 },
+  { value: 'district', label: 'District', depth: 2 },
+  { value: 'city', label: 'Place', depth: 3 },
 ];
+
+// Which kinds may parent each kind.
+export const destinationParentKinds = {
+  country: [],
+  region: ['country'],
+  district: ['region'],
+  city: ['district', 'region', 'country'],
+};
 
 // acceptance: who must accept each published version (all_members, organization_owner) or notice-only.
 export const legalDocumentTypes = [
@@ -178,6 +223,11 @@ export const bookingChangeStatuses = [
   { value: 'withdrawn', label: 'Withdrawn' },
 ];
 
+export const comparisonLabels = [
+  { value: 'lowest', label: 'Lowest total' },
+  { value: 'most_inclusive', label: 'Most inclusive' },
+];
+
 // Age bounds (in years) a guest of each type must have on the trip; adults have no age.
 export const travellerTypes = [
   { value: 'adult', label: 'Adult', minAge: null, maxAge: null },
@@ -202,6 +252,8 @@ const sellers = ['dmc', 'hotelier'];
 const everyone = ['agency', 'dmc', 'hotelier'];
 export const webhookEventTypes = [
   { value: 'request_matched', label: 'New matching request', businessTypes: sellers },
+  { value: 'request_matched_digest', label: 'Daily digest of matching requests', businessTypes: sellers },
+  { value: 'request_no_longer_available', label: 'Request no longer in your area', businessTypes: sellers },
   { value: 'request_deadline_near', label: 'Request deadline is near', businessTypes: everyone },
   { value: 'request_closed', label: 'Request closed for new offers', businessTypes: everyone },
   { value: 'request_expired', label: 'Request expired without offers', businessTypes: agency },
@@ -246,9 +298,13 @@ export const webhookDeliveryStatuses = [
   { value: 'cancelled', label: 'Cancelled (endpoint disabled)' },
 ];
 
+// monitored kinds get an overdue check on the operations dashboard.
 export const operationRunKinds = [
-  { value: 'database_backup', label: 'Database backup' },
-  { value: 'restore_drill', label: 'Restore drill' },
+  { value: 'database_backup', label: 'Database backup', monitored: true },
+  { value: 'restore_drill', label: 'Restore drill', monitored: true },
+  { value: 'destination_import', label: 'Destination import', monitored: false },
+  { value: 'featured_import', label: 'Featured destinations import', monitored: false },
+  { value: 'routing_launch', label: 'Lead routing launch', monitored: false },
 ];
 
 export const documentScanStatuses = [

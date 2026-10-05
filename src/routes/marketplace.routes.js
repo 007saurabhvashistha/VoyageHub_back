@@ -2,21 +2,23 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { Router } from 'express';
 import { loadSession, requireActiveAccount, requireCsrf, requireMfaForPlatformAdmin } from './auth.routes.js';
-import { getMaxOffersPerRequest } from '../services/platformSettings.js';
+import { getMaxOffersPerRequest, getSetting } from '../services/platformSettings.js';
 import { requireCapability } from '../services/permissions.js';
 import { config, isCurrencyCode } from '../config/index.js';
-import { capabilities, groupTypes as groupTypeOptions, hotelCategories, mealPlans as mealPlanOptions, requestVisibilities, serviceTypes as serviceOptions, valuesOf } from '../config/referenceData.js';
+import { audienceFor, capabilities, groupTypes as groupTypeOptions, hotelCategories, mealPlans as mealPlanOptions, requestVisibilities, requirementTypes, serviceTypes as serviceOptions, valuesOf } from '../config/referenceData.js';
 import { loadLineItems, loadOptions, offerOptionDto, offerPricingDto, offerSchemaFor, offerTermsDto, replaceLineItems, replaceOptions } from '../services/offerInput.js';
 import { contactDetailsPattern, containsContactDetails } from '../utils/contactDetails.js';
 import { parseWith } from '../utils/validation.js';
 import { createRateLimiter } from '../utils/rateLimit.js';
 import { z } from 'zod';
 import { reportCategories, reportTargetTypes } from '../config/referenceData.js';
-import { findDestination, sellerMatchesRequestDestination, sellerProfileResponse } from '../services/destinations.js';
+import { resolveActiveDestinations, sellerProfileResponse } from '../services/destinations.js';
+import { findAudience, rerouteRequest, routeLabel, targetPublishedRequest } from '../services/routing.js';
 import { organizationIsActive } from '../services/organizationLifecycle.js';
 import { declineSchema, listNegotiations, loadOpenNegotiations, negotiationDto, negotiationSchema } from '../services/offerNegotiations.js';
 import { findConversation, sellerCanSeeRequest } from '../services/requestConversations.js';
 import { loadAttachments } from '../services/marketplaceAttachments.js';
+import { convertMinorUnits, loadComparisonRates } from '../services/comparisonRates.js';
 
 const reportSchema = z.object({
   target_type: z.enum(reportTargetTypes.map((item) => item.value), { error: 'Choose what you are reporting.' }),
@@ -30,6 +32,7 @@ const mealPlans = valuesOf(mealPlanOptions);
 const serviceTypes = valuesOf(serviceOptions);
 const hotelCategoryValues = valuesOf(hotelCategories);
 const visibilities = valuesOf(requestVisibilities);
+const requirementTypeValues = valuesOf(requirementTypes);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const hourMs = 60 * 60 * 1000;
 const dayMs = 24 * hourMs;
@@ -59,6 +62,9 @@ function offerDto(row, { lineItems = [], options = [], attachments = [], openNeg
     mealPlan: row.meal_plan,
     hotelCategory: row.hotel_category ?? null,
     optionLabel: row.option_label ?? null,
+    hotelPropertyId: row.hotel_property_id ?? null,
+    ...(row.hotel_property_name !== undefined ? { hotelPropertyName: row.hotel_property_name } : {}),
+    ...(row.match_type !== undefined ? { matchType: row.match_type } : {}),
     currency: row.currency,
     inclusions: row.inclusions,
     exclusions: row.exclusions,
@@ -71,6 +77,7 @@ function offerDto(row, { lineItems = [], options = [], attachments = [], openNeg
     ...(request?.trip_version != null ? { needsReconfirmation: Number(row.confirmed_trip_version ?? 1) < Number(request.trip_version) } : {}),
     ...offerTermsDto(row),
     ...(request ? offerPricingDto(row, request) : {}),
+    ...(request?.published_at ? { responseTimeMinutes: Math.max(0, Math.round((new Date(row.created_at).getTime() - new Date(request.published_at).getTime()) / 60000)) } : {}),
     lineItems,
     options: options.map((option) => offerOptionDto(option, row, request)),
     attachments,
@@ -153,8 +160,40 @@ function validDeadline(value) {
   return { deadline };
 }
 
+// Ordered stops; the legacy single destination_id is accepted as a one-stop list.
+function validStops(body) {
+  const raw = Array.isArray(body.destinations)
+    ? body.destinations
+    : typeof body.destination_id === 'string' ? [{ destination_id: body.destination_id }] : [];
+  if (!raw.length) return { error: 'Choose a destination from the destination list.' };
+  const stops = [];
+  for (const item of raw) {
+    const destinationId = typeof item === 'string' ? item : item?.destination_id;
+    const nights = item?.nights == null || item.nights === '' ? null : Number(item.nights);
+    if (typeof destinationId !== 'string' || !uuidPattern.test(destinationId)) return { error: 'Choose each destination from the destination list.' };
+    if (nights != null && (!Number.isInteger(nights) || nights < 1 || nights > 90)) return { error: 'Nights per destination must be between 1 and 90.' };
+    stops.push({ destinationId, nights });
+  }
+  if (new Set(stops.map((stop) => stop.destinationId)).size !== stops.length) return { error: 'Choose each destination only once.' };
+  return { stops };
+}
+
+// Rule: a hotel-only lead has one destination and only hotel services; anything else is an itinerary.
+function validRequirement(requirementType, services, stops, nights) {
+  if (!requirementTypeValues.has(requirementType)) return { error: 'Choose whether you need a hotel only or a full itinerary.', code: 'VALIDATION_ERROR' };
+  const definition = requirementTypes.find((item) => item.value === requirementType);
+  const disallowed = services.filter((service) => !serviceOptions.find((option) => option.value === service)?.allowedFor.includes(requirementType));
+  if (disallowed.length) return { error: `A ${definition.label.toLowerCase()} lead cannot include: ${disallowed.join(', ')}. Choose the itinerary type instead.`, code: 'REQUIREMENT_TYPE_MISMATCH' };
+  if (definition.maxDestinations != null && stops.length > definition.maxDestinations) return { error: `A ${definition.label.toLowerCase()} lead has ${definition.maxDestinations} destination. Choose the itinerary type for multi-stop trips.`, code: 'REQUIREMENT_TYPE_MISMATCH' };
+  const stopNights = stops.map((stop) => stop.nights).filter((value) => value != null);
+  const totalStopNights = stopNights.reduce((sum, value) => sum + value, 0);
+  if (totalStopNights > nights || (stopNights.length === stops.length && stops.length > 1 && totalStopNights !== nights)) {
+    return { error: 'Nights per destination must add up to the trip nights.', code: 'VALIDATION_ERROR' };
+  }
+  return {};
+}
+
 function validRequest(body) {
-  const destinationId = typeof body.destination_id === 'string' ? body.destination_id : '';
   const services = Array.isArray(body.services) ? [...new Set(body.services)] : [];
   const budgetMin = body.budget_min_minor == null ? null : Number(body.budget_min_minor);
   const budgetMax = body.budget_max_minor == null ? null : Number(body.budget_max_minor);
@@ -162,11 +201,14 @@ function validRequest(body) {
   const visibility = body.visibility ?? 'open';
   const invitedSellerIds = Array.isArray(body.invited_seller_ids) ? [...new Set(body.invited_seller_ids)] : [];
 
-  if (!uuidPattern.test(destinationId)) return { error: 'Choose a destination from the destination list.' };
+  const stops = validStops(body);
+  if (stops.error) return stops;
   const trip = validTrip(body);
   if (trip.error) return trip;
   if (!groupTypes.has(body.group_type)) return { error: 'Choose a supported group type.' };
   if (!services.length || services.length > serviceTypes.size || services.some((service) => !serviceTypes.has(service))) return { error: 'Choose one or more supported services.' };
+  const requirement = validRequirement(body.requirement_type, services, stops.stops, trip.nights);
+  if (requirement.error) return requirement;
   if (body.hotel_category != null && !hotelCategoryValues.has(Number(body.hotel_category))) return { error: 'Choose a supported hotel category.' };
   if (body.meal_plan != null && !mealPlans.has(body.meal_plan)) return { error: 'Choose a supported meal plan.' };
   const deadline = validDeadline(body.response_deadline);
@@ -179,7 +221,8 @@ function validRequest(body) {
   if (visibility === 'invite_only' && !invitedSellerIds.length) return { error: 'Invite at least one verified supplier for an invite-only request.' };
 
   return {
-    destinationId,
+    stops: stops.stops,
+    requirementType: body.requirement_type,
     ...trip,
     groupType: body.group_type,
     hotelCategory: body.hotel_category == null ? null : Number(body.hotel_category),
@@ -279,6 +322,9 @@ function requestDto(row) {
     agencyVerified: Boolean(row.agency_verified),
     tripVersion: Number(row.trip_version ?? 1),
     tripChangedAt: row.trip_changed_at ?? null,
+    requirementType: row.requirement_type,
+    destinations: row.stops ?? [],
+    destinationUnresolved: Boolean(row.destination_unresolved),
     awardedAt: row.awarded_at ?? null,
     awardUndoUntil: row.awarded_at && row.award_undoable ? new Date(new Date(row.awarded_at).getTime() + config.awards.undoWindowMs).toISOString() : null,
   };
@@ -293,8 +339,51 @@ function sellerRequestDto(row, offerLimit) {
     hasActiveOffer: Boolean(row.my_offer_id),
     myOfferId: row.my_offer_id ?? null,
     needsReconfirmation: Boolean(row.needs_reconfirmation),
+    matchType: row.match_type ?? null,
+    matchingProperties: row.matching_properties ?? [],
     tripChange: row.last_change_version ? tripChangeDto({ trip_version: row.last_change_version, created_at: row.last_change_at, note: row.last_change_note, previous_trip: row.last_change_previous, current_trip: row.last_change_current }) : null,
   };
+}
+
+// Ordered stops per request for DTOs: [{ destinationId, name, kind, nights }].
+async function loadStops(db, requestIds) {
+  const byRequest = new Map(requestIds.map((id) => [id, []]));
+  if (!requestIds.length) return byRequest;
+  const result = await db.query(
+    `SELECT rd.request_id, rd.destination_id, rd.nights, d.name, d.kind FROM request_destinations rd
+     JOIN destinations d ON d.id = rd.destination_id WHERE rd.request_id = ANY($1::uuid[]) ORDER BY rd.request_id, rd.sequence`,
+    [requestIds],
+  );
+  for (const row of result.rows) byRequest.get(row.request_id)?.push({ destinationId: row.destination_id, name: row.name, kind: row.kind, nights: row.nights });
+  return byRequest;
+}
+
+async function withStops(db, rows) {
+  const stops = await loadStops(db, rows.map((row) => row.id));
+  return rows.map((row) => ({ ...row, stops: stops.get(row.id) ?? [] }));
+}
+
+// Active destinations for the stops, with the hotel-only level rule from platform settings.
+async function resolveStops(db, requirementType, stops) {
+  const resolved = await resolveActiveDestinations(db, stops.map((stop) => stop.destinationId));
+  if (resolved.error) return resolved;
+  if (audienceFor(requirementType) === 'hotelier') {
+    const allowedKinds = await getSetting(db, 'hotel_lead_allowed_destination_kinds');
+    if (!allowedKinds.includes(resolved.rows[0].kind)) return { error: `For a hotel-only lead choose a destination of type: ${allowedKinds.join(', ')}.` };
+  }
+  const maxStops = await getSetting(db, 'max_request_destinations');
+  if (stops.length > maxStops) return { error: `Choose at most ${maxStops} destinations.` };
+  return resolved;
+}
+
+async function replaceStops(db, requestId, stops) {
+  await db.query('DELETE FROM request_destinations WHERE request_id = $1', [requestId]);
+  await db.query(
+    `INSERT INTO request_destinations (request_id, sequence, destination_id, nights)
+     SELECT $1, stop.sequence, stop.destination_id, stop.nights
+     FROM unnest($2::uuid[], $3::int[]) WITH ORDINALITY AS stop(destination_id, nights, sequence)`,
+    [requestId, stops.map((stop) => stop.destinationId), stops.map((stop) => stop.nights)],
+  );
 }
 
 // Only allowlisted fields reach sellers; rebuilt whenever published trip details change.
@@ -308,7 +397,10 @@ const refreshSellerSnapshotSql = `UPDATE marketplace_requests r SET seller_visib
     'budgetMaxMinor', r.budget_max_minor, 'budgetCurrency', r.budget_currency,
     'responseDeadline', r.response_deadline, 'agencyName', o.name,
     'agencyVerified', (o.verified_at IS NOT NULL),
-    'tripVersion', r.trip_version, 'tripChangedAt', r.trip_changed_at
+    'tripVersion', r.trip_version, 'tripChangedAt', r.trip_changed_at,
+    'requirementType', r.requirement_type,
+    'destinations', COALESCE((SELECT jsonb_agg(jsonb_build_object('destinationId', d.id, 'name', d.name, 'kind', d.kind, 'nights', rd.nights) ORDER BY rd.sequence)
+      FROM request_destinations rd JOIN destinations d ON d.id = rd.destination_id WHERE rd.request_id = r.id), '[]'::jsonb)
   ) FROM organizations o WHERE r.id = $1 AND o.id = r.agency_organization_id`;
 
 const tripChangeSchema = z.object({
@@ -343,7 +435,7 @@ const undoAwardSchema = z.object({
 const agencyAwardColumns = `(SELECT MIN(a.created_at) FROM awards a WHERE a.request_id = r.id) AS awarded_at,
   NOT EXISTS (SELECT 1 FROM awards a WHERE a.request_id = r.id AND a.status <> 'awarded') AS award_undoable`;
 
-export function createMarketplaceRouter({ pool }) {
+export function createMarketplaceRouter({ pool, comparisonRateFetch = globalThis.fetch }) {
   const router = Router();
   const reportLimiter = createRateLimiter(config.rateLimits.report, 'Too many reports. Try again later.');
   router.use((request, response, next) => loadSession(pool, request, response, next));
@@ -481,10 +573,13 @@ export function createMarketplaceRouter({ pool }) {
            WHERE r.agency_organization_id = $1 ORDER BY r.created_at DESC`,
           [request.auth.organization_id],
         );
-        return response.json({ requests: result.rows.map(requestDto) });
+        return response.json({ requests: (await withStops(pool, result.rows)).map(requestDto) });
       }
       const result = await pool.query(
         `SELECT r.*, o.name AS agency_name, o.verified_at IS NOT NULL AS agency_verified,
+          t.match_type,
+          (SELECT COALESCE(jsonb_agg(jsonb_build_object('id', hp.id, 'name', hp.name) ORDER BY hp.name), '[]'::jsonb)
+           FROM hotel_properties hp WHERE hp.id = ANY(t.matching_property_ids)) AS matching_properties,
           (SELECT COUNT(*) FROM offers f JOIN seller_profiles p ON p.organization_id = f.seller_organization_id
            WHERE f.request_id = r.id AND p.verification_status = 'approved' AND f.status IN ('submitted', 'shortlisted', 'accepted')) AS offer_count,
           mine.id AS my_offer_id,
@@ -506,7 +601,7 @@ export function createMarketplaceRouter({ pool }) {
       );
       const offerLimit = await getMaxOffersPerRequest(pool);
       const negotiations = await loadOpenNegotiations(pool, result.rows.map((row) => row.my_offer_id).filter(Boolean));
-      return response.json({ requests: result.rows.map((row) => ({ ...sellerRequestDto(row, offerLimit), openNegotiation: negotiations.get(row.my_offer_id) ?? null })) });
+      return response.json({ requests: (await withStops(pool, result.rows)).map((row) => ({ ...sellerRequestDto(row, offerLimit), openNegotiation: negotiations.get(row.my_offer_id) ?? null })) });
     } catch (error) {
       return next(error);
     }
@@ -531,10 +626,14 @@ export function createMarketplaceRouter({ pool }) {
           [request.params.requestId],
         );
         const changes = await pool.query('SELECT * FROM request_trip_changes WHERE request_id = $1 ORDER BY trip_version DESC', [request.params.requestId]);
-        return response.json({ request: { ...requestDto(result.rows[0]), invitedSellers: invited.rows.map((row) => ({ organizationId: row.id, name: row.name, type: row.business_type })), tripChanges: changes.rows.map(tripChangeDto) } });
+        const [withRoute] = await withStops(pool, result.rows);
+        return response.json({ request: { ...requestDto(withRoute), invitedSellers: invited.rows.map((row) => ({ organizationId: row.id, name: row.name, type: row.business_type })), tripChanges: changes.rows.map(tripChangeDto) } });
       }
       const result = await pool.query(
-        `SELECT r.seller_visible_snapshot, change.* FROM request_targets t
+        `SELECT r.seller_visible_snapshot, t.match_type,
+           (SELECT COALESCE(jsonb_agg(jsonb_build_object('id', hp.id, 'name', hp.name) ORDER BY hp.name), '[]'::jsonb)
+            FROM hotel_properties hp WHERE hp.id = ANY(t.matching_property_ids)) AS matching_properties,
+           change.* FROM request_targets t
          JOIN marketplace_requests r ON r.id = t.request_id
          LEFT JOIN LATERAL (SELECT c.trip_version, c.created_at, c.note, c.previous_trip, c.current_trip FROM request_trip_changes c
            WHERE c.request_id = r.id ORDER BY c.trip_version DESC LIMIT 1) change ON TRUE
@@ -544,7 +643,7 @@ export function createMarketplaceRouter({ pool }) {
       );
       if (!result.rowCount) return fail(response, 404, 'REQUEST_NOT_AVAILABLE', 'This request is not available to your organization.');
       const row = result.rows[0];
-      return response.json({ request: { ...row.seller_visible_snapshot, tripChange: row.trip_version ? tripChangeDto(row) : null } });
+      return response.json({ request: { ...row.seller_visible_snapshot, matchType: row.match_type ?? null, matchingProperties: row.matching_properties ?? [], tripChange: row.trip_version ? tripChangeDto(row) : null } });
     } catch (error) {
       return next(error);
     }
@@ -631,17 +730,18 @@ export function createMarketplaceRouter({ pool }) {
   router.post('/requests', requireCapability(capabilities.requestWrite), async (request, response, next) => {
     if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only travel agencies can create marketplace requests.');
     const input = validRequest(request.body ?? {});
-    if (input.error) return fail(response, 400, 'VALIDATION_ERROR', input.error);
+    if (input.error) return fail(response, 400, input.code ?? 'VALIDATION_ERROR', input.error);
     const id = randomUUID();
     const requestCode = `LX-${randomBytes(4).toString('hex').toUpperCase()}`;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      const destination = await findDestination(client, input.destinationId);
-      if (!destination?.active) {
+      const resolved = await resolveStops(client, input.requirementType, input.stops);
+      if (resolved.error) {
         await client.query('ROLLBACK');
-        return fail(response, 400, 'VALIDATION_ERROR', 'Choose a destination from the destination list.');
+        return fail(response, 400, 'VALIDATION_ERROR', resolved.error);
       }
+      const destination = resolved.rows[0];
       if (input.invitedSellerIds.length) {
         const eligible = await client.query(
           `SELECT o.id, o.business_type FROM organizations o
@@ -654,9 +754,10 @@ export function createMarketplaceRouter({ pool }) {
           await client.query('ROLLBACK');
           return fail(response, 400, 'INVALID_INVITATION', 'Invite only verified DMCs and hotels from the supplier directory.');
         }
-        if (!input.services.includes('hotel') && eligible.rows.some((row) => row.business_type === 'hotelier')) {
+        const audience = audienceFor(input.requirementType);
+        if (eligible.rows.some((row) => row.business_type !== audience)) {
           await client.query('ROLLBACK');
-          return fail(response, 400, 'INVALID_INVITATION', 'Add the hotel service before inviting hotels.');
+          return fail(response, 409, 'SELLER_TYPE_NOT_ELIGIBLE', `A ${requirementTypes.find((item) => item.value === input.requirementType).label.toLowerCase()} lead can only be sent to ${audience === 'hotelier' ? 'hotels' : 'DMCs'}.`);
         }
       }
       const result = await client.query(
@@ -664,15 +765,17 @@ export function createMarketplaceRouter({ pool }) {
            id, request_code, agency_organization_id, destination, destination_country,
            travel_start_date, travel_end_date, travel_month, nights, adults, children, infants,
            group_type, hotel_category, room_count, meal_plan, services,
-           budget_min_minor, budget_max_minor, budget_currency, response_deadline, visibility, destination_id
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+           budget_min_minor, budget_max_minor, budget_currency, response_deadline, visibility, destination_id,
+           requirement_type
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
          RETURNING *`,
         [id, requestCode, request.auth.organization_id, destination.name, destination.country_code,
           input.travelStartDate, input.travelEndDate, input.travelMonth, input.nights, input.adults,
           input.children, input.infants, input.groupType, input.hotelCategory, input.roomCount,
           input.mealPlan, input.services, input.budgetMin, input.budgetMax, input.budgetCurrency,
-          input.responseDeadline, input.visibility, destination.id],
+          input.responseDeadline, input.visibility, destination.id, input.requirementType],
       );
+      await replaceStops(client, id, input.stops);
       for (const sellerId of input.invitedSellerIds) {
         await client.query('INSERT INTO request_invitations (request_id, seller_organization_id) VALUES ($1, $2)', [id, sellerId]);
       }
@@ -681,9 +784,112 @@ export function createMarketplaceRouter({ pool }) {
          JOIN organizations o ON o.id = i.seller_organization_id WHERE i.request_id = $1 ORDER BY o.name`,
         [id],
       );
+      const [withRoute] = await withStops(client, result.rows);
       await client.query('COMMIT');
-      const dto = requestDto({ ...result.rows[0], agency_name: request.auth.organization_name, agency_verified: request.auth.verified_at });
+      const dto = requestDto({ ...withRoute, agency_name: request.auth.organization_name, agency_verified: request.auth.verified_at });
       return response.status(201).json({ request: { ...dto, invitedSellers: invited.rows.map((row) => ({ organizationId: row.id, name: row.name, type: row.business_type })) } });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      return next(error);
+    } finally {
+      client.release();
+    }
+  });
+
+  router.post('/requests/audience-preview', requireCapability(capabilities.requestWrite), async (request, response, next) => {
+    if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only travel agencies can preview a lead audience.');
+    const body = request.body ?? {};
+    if (!requirementTypeValues.has(body.requirement_type)) return fail(response, 400, 'VALIDATION_ERROR', 'Choose whether you need a hotel only or a full itinerary.');
+    const stops = validStops(body);
+    if (stops.error) return fail(response, 400, 'VALIDATION_ERROR', stops.error);
+    const hotelCategory = body.hotel_category == null || body.hotel_category === '' ? null : Number(body.hotel_category);
+    if (hotelCategory != null && !hotelCategoryValues.has(hotelCategory)) return fail(response, 400, 'VALIDATION_ERROR', 'Choose a supported hotel category.');
+    try {
+      const resolved = await resolveStops(pool, body.requirement_type, stops.stops);
+      if (resolved.error) return fail(response, 400, 'VALIDATION_ERROR', resolved.error);
+      const audience = await findAudience(pool, {
+        requirementType: body.requirement_type,
+        destinationIds: stops.stops.map((stop) => stop.destinationId),
+        hotelCategory,
+        excludeOrganizationId: request.auth.organization_id,
+      });
+      return response.json({
+        audience: audienceFor(body.requirement_type),
+        sellers: audience.length,
+        fullMatches: audience.filter((row) => row.match_type === 'full').length,
+        partialMatches: audience.filter((row) => row.match_type === 'partial').length,
+        properties: audience.reduce((sum, row) => sum + row.matching_property_ids.length, 0),
+      });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  // Copies a lead into a new draft, optionally switching its type (the only way to change type after publishing).
+  router.post('/requests/:requestId/repost', requireCapability(capabilities.requestWrite), async (request, response, next) => {
+    if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the owning agency can repost this request.');
+    if (!uuidPattern.test(request.params.requestId)) return fail(response, 404, 'REQUEST_NOT_FOUND', 'Request was not found.');
+    const nextType = request.body?.requirement_type;
+    if (nextType != null && !requirementTypeValues.has(nextType)) return fail(response, 400, 'VALIDATION_ERROR', 'Choose a supported lead type.');
+    const cancelOriginal = request.body?.cancel_original === true;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const current = await client.query('SELECT * FROM marketplace_requests WHERE id = $1 AND agency_organization_id = $2 FOR UPDATE', [request.params.requestId, request.auth.organization_id]);
+      const original = current.rows[0];
+      if (!original) {
+        await client.query('ROLLBACK');
+        return fail(response, 404, 'REQUEST_NOT_FOUND', 'Request was not found.');
+      }
+      const requirementType = nextType ?? original.requirement_type;
+      const originalStops = (await loadStops(client, [original.id])).get(original.id);
+      if (!originalStops.length) {
+        await client.query('ROLLBACK');
+        return fail(response, 409, 'DESTINATION_UNRESOLVED', 'Pick a destination for this lead before reposting it.');
+      }
+      const hotelServices = serviceOptions.filter((option) => option.allowedFor.includes(requirementType)).map((option) => option.value);
+      const services = original.services.filter((service) => hotelServices.includes(service));
+      const maxStops = requirementTypes.find((item) => item.value === requirementType).maxDestinations;
+      const stops = originalStops.slice(0, maxStops ?? originalStops.length)
+        .map((stop) => ({ destinationId: stop.destinationId, nights: maxStops === 1 ? null : stop.nights }));
+      const resolved = await resolveStops(client, requirementType, stops);
+      if (resolved.error) {
+        await client.query('ROLLBACK');
+        return fail(response, 409, 'VALIDATION_ERROR', `${resolved.error} Create a new lead instead.`);
+      }
+      const minimumDeadline = new Date(Date.now() + config.requestDeadline.minHours * hourMs);
+      const deadline = new Date(original.response_deadline) > minimumDeadline ? original.response_deadline : new Date(Date.now() + config.requestDeadline.defaultHours * hourMs);
+      const id = randomUUID();
+      const created = await client.query(
+        `INSERT INTO marketplace_requests (
+           id, request_code, agency_organization_id, destination, destination_country, destination_id,
+           travel_start_date, travel_end_date, travel_month, nights, adults, children, infants,
+           group_type, hotel_category, room_count, meal_plan, services,
+           budget_min_minor, budget_max_minor, budget_currency, response_deadline, visibility,
+           requirement_type, reposted_from_request_id)
+         SELECT $1, $2, agency_organization_id, destination, destination_country, destination_id,
+           travel_start_date, travel_end_date, travel_month, nights, adults, children, infants,
+           group_type, hotel_category, room_count, meal_plan, $3,
+           budget_min_minor, budget_max_minor, budget_currency, $4, 'open', $5, id
+         FROM marketplace_requests WHERE id = $6 RETURNING *`,
+        [id, `LX-${randomBytes(4).toString('hex').toUpperCase()}`, services.length ? services : hotelServices.slice(0, 1), deadline, requirementType, original.id],
+      );
+      await replaceStops(client, id, stops);
+      if (cancelOriginal && ['draft', 'open'].includes(original.status)) {
+        await client.query("UPDATE marketplace_requests SET status = 'cancelled', closed_at = NOW(), updated_at = NOW() WHERE id = $1", [original.id]);
+        const sellers = await client.query('SELECT seller_organization_id FROM request_targets WHERE request_id = $1 AND declined_at IS NULL', [original.id]);
+        for (const seller of sellers.rows) {
+          await notify(client, seller.seller_organization_id, 'request_cancelled', 'Request cancelled', `${original.request_code} / The agency cancelled this request.`, { requestId: original.id, requestCode: original.request_code });
+        }
+        await client.query(
+          `UPDATE offers SET status = 'withdrawn', outcome_reason = 'Request cancelled by the agency.', updated_at = NOW()
+           WHERE request_id = $1 AND status IN ('submitted', 'shortlisted')`,
+          [original.id],
+        );
+      }
+      const [withRoute] = await withStops(client, created.rows);
+      await client.query('COMMIT');
+      return response.status(201).json({ request: requestDto({ ...withRoute, agency_name: request.auth.organization_name, agency_verified: request.auth.verified_at }), originalCancelled: cancelOriginal && ['draft', 'open'].includes(original.status) });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       return next(error);
@@ -713,39 +919,29 @@ export function createMarketplaceRouter({ pool }) {
         await client.query('ROLLBACK');
         return fail(response, 409, 'RESPONSE_DEADLINE_PASSED', 'The response deadline has passed. Create a new request with a future deadline.');
       }
+      if (current.rows[0].destination_unresolved) {
+        await client.query('ROLLBACK');
+        return fail(response, 409, 'DESTINATION_UNRESOLVED', 'Pick a destination from the destination list before publishing.');
+      }
       const updated = await client.query(
         `UPDATE marketplace_requests SET status = 'open', published_at = NOW(), updated_at = NOW()
          WHERE id = $1 RETURNING *`,
         [request.params.requestId],
       );
       const row = updated.rows[0];
-      const targets = await client.query(
-        `INSERT INTO request_targets (request_id, seller_organization_id)
-         SELECT r.id, profile.organization_id
-         FROM marketplace_requests r
-         CROSS JOIN seller_profiles profile
-         JOIN organizations seller ON seller.id = profile.organization_id
-         WHERE r.id = $1
-           AND profile.verification_status = 'approved'
-           AND ${organizationIsActive('seller')}
-           AND seller.id <> $2
-           AND (seller.business_type = 'dmc' OR (seller.business_type = 'hotelier' AND 'hotel' = ANY(r.services)))
-           AND (
-             (r.visibility IN ('open', 'open_and_invite') AND ${sellerMatchesRequestDestination})
-             OR (r.visibility IN ('invite_only', 'open_and_invite') AND EXISTS (
-               SELECT 1 FROM request_invitations invitation
-               WHERE invitation.request_id = r.id AND invitation.seller_organization_id = seller.id
-             ))
-           )
-         ON CONFLICT DO NOTHING RETURNING seller_organization_id`,
-        [row.id, request.auth.organization_id],
+      const targeting = await targetPublishedRequest(client, row.id);
+      await client.query(
+        'UPDATE destinations SET lead_count = lead_count + 1 WHERE id IN (SELECT destination_id FROM request_destinations WHERE request_id = $1)',
+        [row.id],
       );
       await client.query(refreshSellerSnapshotSql, [row.id]);
-      for (const target of targets.rows) {
-        await notify(client, target.seller_organization_id, 'request_matched', 'New matching request', `${row.request_code} / ${row.destination} / ${row.nights} nights`, { requestId: row.id, requestCode: row.request_code, destination: row.destination });
-      }
+      const [withRoute] = await withStops(client, [row]);
       await client.query('COMMIT');
-      return response.json({ request: { ...requestDto({ ...row, agency_name: request.auth.organization_name, agency_verified: request.auth.verified_at }), status: 'open' }, targetedSellerCount: targets.rowCount });
+      return response.json({
+        request: { ...requestDto({ ...withRoute, agency_name: request.auth.organization_name, agency_verified: request.auth.verified_at }), status: 'open' },
+        targetedSellerCount: targeting.targets.length,
+        alerts: targeting.alerts,
+      });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       return next(error);
@@ -779,6 +975,8 @@ export function createMarketplaceRouter({ pool }) {
     const requestedDeadline = meta.data.response_deadline ? validDeadline(meta.data.response_deadline) : null;
     if (requestedDeadline?.error) return fail(response, 400, 'VALIDATION_ERROR', requestedDeadline.error);
     if (containsContactDetails(meta.data.note)) return fail(response, 400, 'CONTACT_DETAILS_NOT_ALLOWED', 'Remove contact details and external links from the change note.');
+    const stopInput = request.body?.destinations != null ? validStops({ destinations: request.body.destinations }) : null;
+    if (stopInput?.error) return fail(response, 400, 'VALIDATION_ERROR', stopInput.error);
     const nextTrip = {
       travel_start_date: trip.travelStartDate,
       travel_end_date: trip.travelEndDate,
@@ -807,8 +1005,25 @@ export function createMarketplaceRouter({ pool }) {
       if (row.status !== 'open') return reject(409, 'REQUEST_NOT_OPEN', 'Trip details can only be changed while the request is open for offers.');
       if (new Date(row.response_deadline) <= new Date()) return reject(409, 'RESPONSE_DEADLINE_PASSED', 'The response deadline has passed, so sellers can no longer re-confirm.');
       if (meta.data.trip_version !== Number(row.trip_version)) return reject(409, 'TRIP_CHANGED', 'These trip details were changed by someone else. Reload the request and try again.');
-      const previousTrip = tripFields({ ...row, travel_start_date: row.start_text, travel_end_date: row.end_text });
-      if (isDeepStrictEqual(previousTrip, nextTrip)) return reject(400, 'NO_TRIP_CHANGES', 'Change the dates, travellers or rooms before saving.');
+      if (request.body?.requirement_type != null && request.body.requirement_type !== row.requirement_type) {
+        return reject(409, 'REQUIREMENT_TYPE_LOCKED', 'The lead type cannot change after publishing. Cancel this lead and repost it with the other type.');
+      }
+      const currentStops = (await loadStops(client, [row.id])).get(row.id);
+      const stops = stopInput?.stops ?? currentStops.map((stop) => ({ destinationId: stop.destinationId, nights: stop.nights }));
+      const requirement = validRequirement(row.requirement_type, row.services, stops, nextTrip.nights);
+      if (requirement.code === 'REQUIREMENT_TYPE_MISMATCH') return reject(409, 'REQUIREMENT_TYPE_LOCKED', `${requirement.error} The lead type cannot change after publishing.`);
+      if (requirement.error) return reject(400, 'VALIDATION_ERROR', requirement.error);
+      if (stopInput) {
+        const resolved = await resolveStops(client, row.requirement_type, stops);
+        if (resolved.error) return reject(400, 'VALIDATION_ERROR', resolved.error);
+      }
+      const previousTrip = { ...tripFields({ ...row, travel_start_date: row.start_text, travel_end_date: row.end_text }), destinations: currentStops.map((stop) => ({ destination_id: stop.destinationId, name: stop.name, nights: stop.nights })) };
+      const destinationsChanged = !isDeepStrictEqual(
+        currentStops.map((stop) => [stop.destinationId, stop.nights]),
+        stops.map((stop) => [stop.destinationId, stop.nights]),
+      );
+      const comparableNext = { ...nextTrip, destinations: previousTrip.destinations };
+      if (isDeepStrictEqual(previousTrip, comparableNext) && !destinationsChanged) return reject(400, 'NO_TRIP_CHANGES', 'Change the dates, travellers, rooms or destinations before saving.');
       const currentDeadline = new Date(row.response_deadline);
       if (requestedDeadline && requestedDeadline.deadline < currentDeadline) return reject(400, 'VALIDATION_ERROR', 'After publishing, the response deadline can be extended but not shortened.');
       const deadline = requestedDeadline?.deadline ?? currentDeadline;
@@ -825,30 +1040,48 @@ export function createMarketplaceRouter({ pool }) {
           nextTrip.adults, nextTrip.children, nextTrip.infants, nextTrip.room_count, deadline],
       );
       const changed = updated.rows[0];
+      let routing = null;
+      if (destinationsChanged) {
+        await replaceStops(client, row.id, stops);
+        const primary = (await resolveActiveDestinations(client, [stops[0].destinationId])).rows[0];
+        await client.query(
+          'UPDATE marketplace_requests SET destination_id = $2, destination = $3, destination_country = $4 WHERE id = $1',
+          [row.id, primary.id, primary.name, primary.country_code],
+        );
+        Object.assign(changed, { destination_id: primary.id, destination: primary.name, destination_country: primary.country_code });
+        await client.query(
+          'UPDATE destinations SET lead_count = lead_count + 1 WHERE id IN (SELECT destination_id FROM request_destinations WHERE request_id = $1) AND NOT (id = ANY($2::uuid[]))',
+          [row.id, currentStops.map((stop) => stop.destinationId)],
+        );
+      }
+      const newStops = (await loadStops(client, [row.id])).get(row.id);
+      nextTrip.destinations = newStops.map((stop) => ({ destination_id: stop.destinationId, name: stop.name, nights: stop.nights }));
       const change = await client.query(
         `INSERT INTO request_trip_changes (id, request_id, trip_version, changed_by_user_id, previous_trip, current_trip, note)
          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
         [randomUUID(), row.id, changed.trip_version, request.auth.user_id, JSON.stringify(previousTrip), JSON.stringify(nextTrip), meta.data.note],
       );
       await client.query(refreshSellerSnapshotSql, [row.id]);
+      if (destinationsChanged) routing = await rerouteRequest(client, row.id);
       const sellers = await client.query(
-        `SELECT t.seller_organization_id, (f.id IS NOT NULL) AS has_offer FROM request_targets t
-         LEFT JOIN offers f ON f.request_id = t.request_id AND f.seller_organization_id = t.seller_organization_id
-           AND f.status IN ('submitted', 'shortlisted')
-         WHERE t.request_id = $1 AND t.declined_at IS NULL`,
-        [row.id],
+        `SELECT t.seller_organization_id, EXISTS (SELECT 1 FROM offers f WHERE f.request_id = t.request_id
+           AND f.seller_organization_id = t.seller_organization_id AND f.status IN ('submitted', 'shortlisted')) AS has_offer
+         FROM request_targets t
+         WHERE t.request_id = $1 AND t.declined_at IS NULL AND NOT (t.seller_organization_id = ANY($2::uuid[]))`,
+        [row.id, routing?.newlyMatched ?? []],
       );
       const summary = tripDto(nextTrip);
       for (const seller of sellers.rows) {
         await notify(client, seller.seller_organization_id, 'request_trip_changed',
           seller.has_offer ? 'Trip changed: re-confirm your offer' : 'Trip details changed',
-          `${row.request_code} / ${row.destination} / ${summary.dates} / ${summary.travelers}`,
+          `${row.request_code} / ${routeLabel(newStops) || changed.destination} / ${summary.dates} / ${summary.travelers}`,
           { requestId: row.id, requestCode: row.request_code, tripVersion: changed.trip_version });
       }
       await client.query('COMMIT');
       return response.json({
-        request: { ...requestDto({ ...changed, agency_name: request.auth.organization_name, agency_verified: request.auth.verified_at }), tripChange: tripChangeDto(change.rows[0]) },
+        request: { ...requestDto({ ...changed, stops: newStops, agency_name: request.auth.organization_name, agency_verified: request.auth.verified_at }), tripChange: tripChangeDto(change.rows[0]) },
         offersAwaitingReconfirmation: sellers.rows.filter((seller) => seller.has_offer).length,
+        routing: routing ? { newlyMatched: routing.newlyMatched.length, removed: routing.removed.length, grandfathered: routing.grandfathered.length } : null,
       });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
@@ -887,6 +1120,8 @@ export function createMarketplaceRouter({ pool }) {
     const offerInput = input.data;
     const acknowledgedTripVersion = parseTripVersion(request.body?.trip_version);
     if (acknowledgedTripVersion === undefined) return fail(response, 400, 'VALIDATION_ERROR', 'Trip version must be a positive whole number.');
+    const requestedPropertyId = request.body?.hotel_property_id ?? null;
+    if (requestedPropertyId != null && (typeof requestedPropertyId !== 'string' || !uuidPattern.test(requestedPropertyId))) return fail(response, 400, 'VALIDATION_ERROR', 'Choose one of your hotels for this offer.');
 
     const client = await pool.connect();
     try {
@@ -898,13 +1133,14 @@ export function createMarketplaceRouter({ pool }) {
       }
       const target = await client.query(
         `SELECT r.id, r.agency_organization_id, r.request_code, r.destination, r.services, r.response_deadline,
-                r.adults, r.children, r.nights, r.room_count, r.trip_version
+                r.adults, r.children, r.nights, r.room_count, r.trip_version, r.requirement_type,
+                t.match_type, t.matching_property_ids
          FROM request_targets t JOIN marketplace_requests r ON r.id = t.request_id
          WHERE t.request_id = $1 AND t.seller_organization_id = $2 AND t.declined_at IS NULL AND r.status = 'open'
          FOR UPDATE OF r`,
         [request.params.requestId, request.auth.organization_id],
       );
-      if (!target.rowCount) {
+      if (!target.rowCount || audienceFor(target.rows[0].requirement_type) !== request.auth.business_type) {
         await client.query('ROLLBACK');
         return fail(response, 404, 'REQUEST_NOT_AVAILABLE', 'This request is not available to your organization.');
       }
@@ -916,9 +1152,29 @@ export function createMarketplaceRouter({ pool }) {
         await client.query('ROLLBACK');
         return fail(response, 409, 'RESPONSE_DEADLINE_PASSED', 'The response deadline for this request has passed.');
       }
-      if (isHotelier && !target.rows[0].services.includes('hotel')) {
-        await client.query('ROLLBACK');
-        return fail(response, 409, 'HOTEL_NOT_REQUESTED', 'The agency did not request hotel services.');
+      let hotelPropertyId = null;
+      if (isHotelier) {
+        // Invited hotels may offer any approved property; matched hotels only the properties in the requested area.
+        const eligibleProperties = await client.query(
+          `SELECT id FROM hotel_properties WHERE organization_id = $1 AND active AND verification_status = 'approved'
+             AND ($2::boolean OR id = ANY($3::uuid[])) ORDER BY created_at, id`,
+          [request.auth.organization_id, target.rows[0].match_type === 'invited', target.rows[0].matching_property_ids],
+        );
+        const eligibleIds = eligibleProperties.rows.map((row) => row.id);
+        hotelPropertyId = requestedPropertyId ?? (eligibleIds.length === 1 ? eligibleIds[0] : null);
+        if (!hotelPropertyId || !eligibleIds.includes(hotelPropertyId)) {
+          await client.query('ROLLBACK');
+          return fail(response, 400, 'HOTEL_PROPERTY_REQUIRED', 'Choose which of your matching hotels this offer is for.');
+        }
+        const perOrganization = await getSetting(client, 'max_offers_per_hotel_org_per_request');
+        const ownOffers = await client.query(
+          "SELECT COUNT(*) AS total FROM offers WHERE request_id = $1 AND seller_organization_id = $2 AND status IN ('submitted', 'shortlisted', 'accepted')",
+          [request.params.requestId, request.auth.organization_id],
+        );
+        if (Number(ownOffers.rows[0].total) >= perOrganization) {
+          await client.query('ROLLBACK');
+          return fail(response, 409, 'OFFER_ALREADY_SUBMITTED', `Your organization can send at most ${perOrganization} offer(s) for this request.`);
+        }
       }
       const offerLimit = await getMaxOffersPerRequest(client);
       const activeOffers = await client.query(
@@ -934,8 +1190,8 @@ export function createMarketplaceRouter({ pool }) {
         `INSERT INTO offers (id, request_id, seller_organization_id, offer_kind, total_minor, rate_per_night_minor,
            room_type, currency, inclusions, exclusions, meal_plan, validity_until, cancellation_policy,
            free_cancellation_until, deposit_percent, balance_due_days_before_travel, payment_notes,
-           room_count, taxes_included, availability_confirmed, confirmed_trip_version, hotel_category, option_label)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+           room_count, taxes_included, availability_confirmed, confirmed_trip_version, hotel_category, option_label, hotel_property_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
          RETURNING *`,
         [randomUUID(), request.params.requestId, request.auth.organization_id, offerKind,
           offerInput.total_minor ?? null, offerInput.rate_per_night_minor ?? null, offerInput.room_type ?? null,
@@ -943,7 +1199,7 @@ export function createMarketplaceRouter({ pool }) {
           offerInput.cancellation_policy, offerInput.free_cancellation_until, offerInput.deposit_percent,
           offerInput.balance_due_days_before_travel, offerInput.payment_notes, offerInput.room_count ?? null,
           offerInput.taxes_included ?? null, offerInput.availability_confirmed ?? null, target.rows[0].trip_version,
-          offerInput.hotel_category ?? null, offerInput.option_label],
+          offerInput.hotel_category ?? null, offerInput.option_label, hotelPropertyId],
       );
       const offer = result.rows[0];
       await replaceLineItems(client, offer.id, offerInput.line_items ?? [], randomUUID);
@@ -954,7 +1210,7 @@ export function createMarketplaceRouter({ pool }) {
       return response.status(201).json({ offer: offerDto(offer, { ...parts(offer.id), request: target.rows[0] }) });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
-      if (error.code === '23505') return fail(response, 409, 'OFFER_ALREADY_SUBMITTED', 'Your organization already has an active offer for this request.');
+      if (error.code === '23505') return fail(response, 409, 'OFFER_ALREADY_SUBMITTED', 'Your organization already has an active offer for this request (and hotel).');
       return next(error);
     } finally {
       client.release();
@@ -963,20 +1219,80 @@ export function createMarketplaceRouter({ pool }) {
 
   router.get('/requests/:requestId/offers', async (request, response, next) => {
     if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the requesting agency can compare offers.');
+    const matchFilter = typeof request.query.match_type === 'string' ? request.query.match_type : null;
     try {
-      const ownedRequest = await pool.query('SELECT id, adults, children, nights, room_count, trip_version FROM marketplace_requests WHERE id = $1 AND agency_organization_id = $2', [request.params.requestId, request.auth.organization_id]);
+      const ownedRequest = await pool.query('SELECT id, adults, children, nights, room_count, trip_version, published_at FROM marketplace_requests WHERE id = $1 AND agency_organization_id = $2', [request.params.requestId, request.auth.organization_id]);
       if (!ownedRequest.rowCount) return fail(response, 404, 'REQUEST_NOT_FOUND', 'Request was not found.');
       const result = await pool.query(
-        `SELECT f.*, seller.name AS seller_name
+        `SELECT f.*, seller.name AS seller_name, target.match_type, property.name AS hotel_property_name
          FROM offers f JOIN organizations seller ON seller.id = f.seller_organization_id
          JOIN seller_profiles profile ON profile.organization_id = seller.id
+         LEFT JOIN request_targets target ON target.request_id = f.request_id AND target.seller_organization_id = f.seller_organization_id
+         LEFT JOIN hotel_properties property ON property.id = f.hotel_property_id
          WHERE f.request_id = $1 AND profile.verification_status = 'approved'
            AND f.status IN ('submitted', 'shortlisted', 'accepted')
+           AND ($2::text IS NULL OR target.match_type = $2)
          ORDER BY f.created_at ASC`,
-        [request.params.requestId],
+        [request.params.requestId, matchFilter],
       );
       const parts = await loadOfferParts(pool, result.rows.map((row) => row.id));
-      return response.json({ offers: result.rows.map((offer) => offerDto(offer, { ...parts(offer.id), request: ownedRequest.rows[0], sellerName: offer.seller_name })) });
+      const comparisonCurrency = config.defaultCurrency;
+      const rates = await loadComparisonRates(pool, result.rows.map((offer) => offer.currency), { quoteCurrency: comparisonCurrency, fetchImpl: comparisonRateFetch });
+      const offers = result.rows.map((offer) => {
+        const dto = offerDto(offer, { ...parts(offer.id), request: ownedRequest.rows[0], sellerName: offer.seller_name });
+        const exchangeRate = rates.get(offer.currency);
+        const comparisonTotalMinor = exchangeRate ? convertMinorUnits(dto.estimatedTotalMinor, exchangeRate.rate, offer.currency, comparisonCurrency) : null;
+        const comparisonPerTravellerMinor = comparisonTotalMinor != null && dto.travellers > 0 ? Math.round(comparisonTotalMinor / dto.travellers) : null;
+        const options = dto.options.map((option) => {
+          const total = exchangeRate ? convertMinorUnits(option.estimatedTotalMinor, exchangeRate.rate, offer.currency, comparisonCurrency) : null;
+          return { ...option, comparisonTotalMinor: total, comparisonPerTravellerMinor: total != null && option.travellers > 0 ? Math.round(total / option.travellers) : null };
+        });
+        return {
+          ...dto,
+          options,
+          comparisonTotalMinor,
+          comparisonPerTravellerMinor,
+          comparisonCurrency,
+          exchangeRate,
+          comparisonLabels: [],
+        };
+      });
+      const validPrices = offers.filter((offer) => offer.comparisonTotalMinor != null);
+      if (validPrices.length === offers.length && offers.length) {
+        const lowest = Math.min(...validPrices.map((offer) => offer.comparisonTotalMinor));
+        for (const offer of offers) if (offer.comparisonTotalMinor === lowest) offer.comparisonLabels.push('lowest');
+      }
+      const hasInclusionData = offers.some((offer) => offer.inclusions.length || offer.exclusions.length);
+      if (hasInclusionData) {
+        const mostInclusions = Math.max(...offers.map((offer) => offer.inclusions.length));
+        const fewestExclusions = Math.min(...offers.filter((offer) => offer.inclusions.length === mostInclusions).map((offer) => offer.exclusions.length));
+        for (const offer of offers) {
+          if (offer.inclusions.length === mostInclusions && offer.exclusions.length === fewestExclusions) offer.comparisonLabels.push('most_inclusive');
+        }
+      }
+      return response.json({ offers, comparisonCurrency });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.post('/offers/:offerId/shortlist', requireCapability(capabilities.requestWrite), async (request, response, next) => {
+    if (request.auth.business_type !== 'agency') return fail(response, 403, 'ROLE_FORBIDDEN', 'Only the requesting agency can shortlist an offer.');
+    if (!uuidPattern.test(request.params.offerId)) return fail(response, 404, 'OFFER_NOT_FOUND', 'Offer was not found.');
+    if (typeof request.body?.shortlisted !== 'boolean') return fail(response, 400, 'VALIDATION_ERROR', 'Choose whether this offer is shortlisted.');
+    try {
+      const result = await pool.query(
+        `UPDATE offers f SET status = $3, updated_at = NOW()
+         FROM marketplace_requests r
+         WHERE f.id = $1 AND f.request_id = r.id AND r.agency_organization_id = $2
+           AND r.status IN ('open', 'closed') AND f.status IN ('submitted', 'shortlisted')
+           AND (f.status = CASE WHEN $3 = 'shortlisted' THEN 'submitted' ELSE 'shortlisted' END
+             OR f.status = $3)
+         RETURNING f.id, f.status`,
+        [request.params.offerId, request.auth.organization_id, request.body.shortlisted ? 'shortlisted' : 'submitted'],
+      );
+      if (!result.rowCount) return fail(response, 404, 'OFFER_NOT_AVAILABLE', 'This active offer is not available to shortlist.');
+      return response.json({ offerId: result.rows[0].id, status: result.rows[0].status, shortlisted: result.rows[0].status === 'shortlisted' });
     } catch (error) {
       return next(error);
     }
@@ -986,9 +1302,10 @@ export function createMarketplaceRouter({ pool }) {
     try {
       const result = await pool.query(
         `SELECT f.*, r.agency_organization_id, r.request_code, r.destination, r.adults, r.children, r.nights,
-                r.room_count AS request_room_count, r.trip_version, seller.name AS seller_name
+                r.room_count AS request_room_count, r.trip_version, seller.name AS seller_name, property.name AS hotel_property_name
          FROM offers f JOIN marketplace_requests r ON r.id = f.request_id
          JOIN organizations seller ON seller.id = f.seller_organization_id
+         LEFT JOIN hotel_properties property ON property.id = f.hotel_property_id
          WHERE f.id = $1`,
         [request.params.offerId],
       );

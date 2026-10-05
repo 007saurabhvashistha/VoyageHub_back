@@ -79,6 +79,7 @@ export async function closeOrganization(client, organizationId) {
      WHERE organization_id = $1`,
     [organizationId],
   );
+  await client.query("UPDATE hotel_properties SET active = FALSE, name = 'Closed hotel', updated_at = NOW() WHERE organization_id = $1", [organizationId]);
   await client.query(
     'UPDATE organizations SET name = $2, closed_at = NOW(), closure_requested_at = COALESCE(closure_requested_at, NOW()) WHERE id = $1',
     [organizationId, closedOrganizationName],

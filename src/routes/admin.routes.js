@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { Router } from 'express';
 import { loadSession, requireActiveAccount, requireCsrf, requireMfaForPlatformAdmin } from './auth.routes.js';
-import { listSettings, platformSettingDefinitions, settingSchema, updateSetting } from '../services/platformSettings.js';
-import { sellerMatchesRequestDestination } from '../services/destinations.js';
-import { organizationIsActive } from '../services/organizationLifecycle.js';
+import { listSettings, platformSettingDefinitions, settingErrorMessage, settingSchema, updateSetting } from '../services/platformSettings.js';
+import { retargetSeller } from '../services/routing.js';
+import { registerHotelPropertyAdminRoutes } from './adminHotelProperties.routes.js';
 import { registerModerationRoutes } from './moderation.routes.js';
 import { registerDestinationAdminRoutes } from './adminDestinations.routes.js';
 import { registerLegalAdminRoutes } from './adminLegal.routes.js';
@@ -32,6 +32,7 @@ export function createAdminRouter({ pool, storage = null }) {
   registerDocumentAdminRoutes(router, pool, storage);
   registerOperationsAdminRoutes(router, pool);
   registerAgencyVerificationAdminRoutes(router, pool);
+  registerHotelPropertyAdminRoutes(router, pool);
 
   router.get('/settings', async (_request, response, next) => {
     try {
@@ -44,9 +45,8 @@ export function createAdminRouter({ pool, storage = null }) {
   router.put('/settings/:key', requireCsrf, async (request, response, next) => {
     const key = request.params.key;
     if (!Object.hasOwn(platformSettingDefinitions, key)) return fail(response, 404, 'SETTING_NOT_FOUND', 'This platform setting does not exist.');
-    const definition = platformSettingDefinitions[key];
     const parsed = settingSchema(key).safeParse(request.body?.value);
-    if (!parsed.success) return fail(response, 400, 'VALIDATION_ERROR', `${definition.label} must be a whole number from ${definition.min} to ${definition.max}.`);
+    if (!parsed.success) return fail(response, 400, 'VALIDATION_ERROR', settingErrorMessage(key));
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -174,35 +174,12 @@ export function createAdminRouter({ pool, storage = null }) {
         [randomUUID(), request.params.organizationId, request.auth.user_id, decision, reason],
       );
       if (decision === 'approved') {
-        const retargeted = await client.query(
-          `INSERT INTO request_targets (request_id, seller_organization_id)
-           SELECT r.id, profile.organization_id
-           FROM marketplace_requests r
-           JOIN seller_profiles profile ON profile.organization_id = $1
-           JOIN organizations seller ON seller.id = profile.organization_id
-           WHERE r.status = 'open' AND r.response_deadline > NOW() AND ${organizationIsActive('seller')}
-             AND (seller.business_type = 'dmc' OR (seller.business_type = 'hotelier' AND 'hotel' = ANY(r.services)))
-             AND (
-               (r.visibility IN ('open', 'open_and_invite') AND ${sellerMatchesRequestDestination})
-               OR (r.visibility IN ('invite_only', 'open_and_invite') AND EXISTS (
-                 SELECT 1 FROM request_invitations invitation
-                 WHERE invitation.request_id = r.id AND invitation.seller_organization_id = profile.organization_id
-               ))
-             )
-           ON CONFLICT (request_id, seller_organization_id) DO UPDATE
-             SET declined_at = NULL, decline_reason = NULL, matched_at = NOW()
-             WHERE request_targets.declined_at IS NOT NULL
-           RETURNING seller_organization_id, request_id`,
-          [request.params.organizationId],
+        await client.query(
+          `UPDATE hotel_properties SET verification_status = 'approved', reviewed_by = $2, reviewed_at = NOW(), updated_at = NOW()
+           WHERE organization_id = $1 AND verification_status = 'pending'`,
+          [request.params.organizationId, request.auth.user_id],
         );
-        for (const target of retargeted.rows) {
-          const matchedRequest = await client.query('SELECT id, request_code, destination, nights FROM marketplace_requests WHERE id = $1', [target.request_id]);
-          const item = matchedRequest.rows[0];
-          await client.query(
-            'INSERT INTO notifications (id, organization_id, event_type, title, message, data) VALUES ($1, $2, $3, $4, $5, $6)',
-            [randomUUID(), target.seller_organization_id, 'request_matched', 'New matching request', `${item.request_code} / ${item.destination} / ${item.nights} nights`, JSON.stringify({ requestId: item.id, requestCode: item.request_code, destination: item.destination })],
-          );
-        }
+        await retargetSeller(client, request.params.organizationId);
       }
       await client.query('COMMIT');
       return response.json({ organizationId: updated.rows[0].organization_id, status: updated.rows[0].verification_status, reason: updated.rows[0].verification_reason });

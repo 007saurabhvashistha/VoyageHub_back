@@ -11,7 +11,7 @@ Background workers (notification email, request deadlines, reminders, document s
 ## Emails are not arriving
 
 Platform admin, Notification outbox shows each email's status.
-- `blocked_config` / `provider_not_configured`: Resend is not configured. Set `EMAIL_PROVIDER=resend`, `RESEND_API_KEY`, `NOTIFICATION_EMAIL_FROM` (verified domain) and `APP_BASE_URL`, then redeploy. Blocked entries are picked up automatically.
+- `blocked_config` / `provider_not_configured`: email is not configured. For Resend, set `EMAIL_PROVIDER=resend` and `RESEND_API_KEY`; for SMTP, set `EMAIL_PROVIDER=smtp`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, and `SMTP_PASS`. Both providers need `NOTIFICATION_EMAIL_FROM` (authorized sender), `APP_BASE_URL`, and `EMAIL_TOKEN_ENCRYPTION_KEY`; then restart or redeploy. Blocked entries are picked up automatically.
 - `retrying`: provider errors; they back off and retry. Check Resend status and the API key.
 - `dead_letter`: retries exhausted. Fix the cause, then use Retry on the entry.
 - `recipient_email_unverified`: expected for unverified accounts.
