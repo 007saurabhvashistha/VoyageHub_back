@@ -150,6 +150,60 @@ test('login checks the selected business type and logout requires CSRF protectio
   assert.equal(profile.status, 401);
 });
 
+test('session inventory is private and sign out everywhere revokes all of the user sessions', async (context) => {
+  const { pool, baseUrl } = await startIdentityApp(context);
+  await registerAndVerify(baseUrl, pool);
+  const login = async (email = registration.email) => {
+    const response = await fetch(`${baseUrl}/v1/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email, password: registration.password, business_type: 'agency' }),
+    });
+    assert.equal(response.status, 200);
+    return { cookie: response.headers.get('set-cookie').split(';')[0], ...(await response.json()) };
+  };
+  const current = await login();
+  const other = await login();
+  const currentCookie = { cookie: current.cookie };
+  const list = await fetch(`${baseUrl}/v1/auth/sessions`, { headers: { cookie: current.cookie } });
+  assert.equal(list.status, 200);
+  assert.equal(list.headers.get('cache-control'), 'private, no-store');
+  const { sessions } = await list.json();
+  assert.equal(sessions.length, 2);
+  const currentSession = sessions.find((session) => session.current);
+  const otherSession = sessions.find((session) => !session.current);
+  assert.ok(currentSession);
+  assert.ok(otherSession);
+  assert.equal(otherSession.organizationName, 'Northstar Travel');
+
+  await registerAndVerify(baseUrl, pool, { ...registration, full_name: 'Other User', organization_name: 'Other Agency', email: 'other@example.test' });
+  const foreign = await login('other@example.test');
+  const foreignSessions = await (await fetch(`${baseUrl}/v1/auth/sessions`, { headers: { cookie: foreign.cookie } })).json();
+  const crossUserRevoke = await fetch(`${baseUrl}/v1/auth/sessions/${foreignSessions.sessions[0].id}`, {
+    method: 'DELETE',
+    headers: { cookie: current.cookie, 'x-csrf-token': current.csrfToken },
+  });
+  assert.equal(crossUserRevoke.status, 404);
+
+  const revokeWithoutCsrf = await fetch(`${baseUrl}/v1/auth/sessions/${otherSession.id}`, { method: 'DELETE', headers: { cookie: current.cookie } });
+  assert.equal(revokeWithoutCsrf.status, 403);
+  const revokeOther = await fetch(`${baseUrl}/v1/auth/sessions/${otherSession.id}`, { method: 'DELETE', headers: { cookie: current.cookie, 'x-csrf-token': current.csrfToken } });
+  assert.equal(revokeOther.status, 204);
+  assert.equal((await fetch(`${baseUrl}/v1/auth/me`, { headers: { cookie: other.cookie } })).status, 401);
+  assert.equal((await (await fetch(`${baseUrl}/v1/auth/sessions`, { headers: { cookie: current.cookie } })).json()).sessions.length, 1);
+
+  const signOutWithoutCsrf = await fetch(`${baseUrl}/v1/auth/sessions/sign-out-everywhere`, { method: 'POST', headers: { cookie: current.cookie } });
+  assert.equal(signOutWithoutCsrf.status, 403);
+  const signOutEverywhere = await fetch(`${baseUrl}/v1/auth/sessions/sign-out-everywhere`, {
+    method: 'POST',
+    headers: { cookie: current.cookie, 'x-csrf-token': current.csrfToken },
+  });
+  assert.equal(signOutEverywhere.status, 200);
+  assert.equal((await signOutEverywhere.json()).revokedSessions, 1);
+  assert.match(signOutEverywhere.headers.get('set-cookie'), /Expires=Thu, 01 Jan 1970/i);
+  assert.equal((await fetch(`${baseUrl}/v1/auth/me`, { headers: { cookie: current.cookie } })).status, 401);
+});
+
 test('login does not authenticate an account under a different business type', async (context) => {
   const { pool, baseUrl } = await startIdentityApp(context);
   await registerAndVerify(baseUrl, pool);

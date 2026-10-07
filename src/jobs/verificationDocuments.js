@@ -2,11 +2,16 @@ import { randomUUID } from 'node:crypto';
 import { config } from '../config/index.js';
 import { recordOrganizationEvent } from '../services/organizationAudit.js';
 import { getSetting } from '../services/platformSettings.js';
-import { documentDto, sha256Hex } from '../services/verificationDocuments.js';
+import { documentDto, documentRequirementsFor, sha256Hex } from '../services/verificationDocuments.js';
 
 const scanBatchSize = 10;
 const retentionBatchSize = 100;
 const dayMs = 24 * 60 * 60 * 1000;
+
+function dateOnly(value) {
+  if (value == null) return null;
+  return value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10);
+}
 
 async function inTransaction(pool, work) {
   const client = await pool.connect();
@@ -50,6 +55,12 @@ const scanSources = [
     ownerId: (row) => row.owner_organization_id,
     label: (row) => `Attachment ${row.original_filename}`,
     data: (row) => ({ attachmentId: row.id, requestId: row.request_id, offerId: row.offer_id, messageId: row.message_id }),
+  },
+  {
+    table: 'hotel_property_photos',
+    ownerId: (row) => row.organization_id,
+    label: (row) => `Hotel photo ${row.original_filename}`,
+    data: (row) => ({ photoId: row.id, propertyId: row.property_id }),
   },
 ];
 
@@ -163,6 +174,10 @@ export async function processDocumentRetention(pool, { storage, now = () => new 
      SELECT 'marketplace_attachments', a.id, a.storage_key, a.storage_provider, a.created_at FROM marketplace_attachments a
      JOIN organizations o ON o.id = a.owner_organization_id
      WHERE a.deleted_at IS NULL AND o.closed_at IS NOT NULL AND o.closed_at <= $1
+    UNION ALL
+    SELECT 'hotel_property_photos', photo.id, photo.storage_key, photo.storage_provider, photo.created_at FROM hotel_property_photos photo
+    JOIN organizations o ON o.id = photo.organization_id
+    WHERE photo.deleted_at IS NULL AND o.closed_at IS NOT NULL AND o.closed_at <= $1
      ORDER BY created_at LIMIT $3`,
     [new Date(current.getTime() - closedDays * dayMs), new Date(current.getTime() - rejectedDays * dayMs), retentionBatchSize],
   );
@@ -177,6 +192,151 @@ export async function processDocumentRetention(pool, { storage, now = () => new 
     }
   }
   return summary;
+}
+
+export async function processDocumentExpiryReminders(pool, {
+  now = () => new Date(),
+  reminderDays = config.documents.expiryReminderDays,
+  batchSize = config.documents.expiryBatchSize,
+} = {}) {
+  const currentDate = now().toISOString().slice(0, 10);
+  const schedule = [...new Set(reminderDays)].sort((left, right) => left - right);
+  const summary = { reminders: 0, expired: 0, verificationResets: 0, failures: 0 };
+  if (!schedule.length) return summary;
+
+  const due = await pool.query(
+    `WITH due_documents AS (
+       SELECT document.id, document.expires_at, organization.business_type, organization.country_code,
+              CASE WHEN document.expires_at < $1::date THEN 0
+                ELSE (SELECT MIN(offset_days) FROM UNNEST($2::int[]) AS offsets(offset_days)
+                      WHERE offset_days >= document.expires_at - $1::date
+                        AND NOT EXISTS (
+                          SELECT 1 FROM organization_document_expiry_notices existing_notice
+                          WHERE existing_notice.document_id = document.id
+                            AND existing_notice.notice_kind = 'upcoming'
+                            AND existing_notice.reminder_days_before <= offset_days
+                        ))
+              END AS reminder_days_before
+       FROM organization_documents document
+       JOIN organizations organization ON organization.id = document.organization_id
+       WHERE document.expires_at IS NOT NULL AND document.superseded_at IS NULL
+         AND document.deleted_at IS NULL AND document.scan_status = 'clean'
+         AND document.expires_at <= $1::date + $3::int
+     )
+     SELECT due_documents.* FROM due_documents
+     WHERE due_documents.reminder_days_before IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM organization_document_expiry_notices notice
+         WHERE notice.document_id = due_documents.id
+           AND notice.notice_kind = CASE WHEN due_documents.expires_at < $1::date THEN 'expired' ELSE 'upcoming' END
+           AND notice.reminder_days_before = due_documents.reminder_days_before
+       )
+     ORDER BY due_documents.expires_at, due_documents.id LIMIT $4`,
+    [currentDate, schedule, schedule.at(-1), batchSize],
+  );
+
+  for (const dueDocument of due.rows) {
+    try {
+      const handled = await inTransaction(pool, async (client) => {
+        const selected = await client.query(
+          `SELECT document.*, organization.business_type, organization.country_code, organization.name AS organization_name
+           FROM organization_documents document JOIN organizations organization ON organization.id = document.organization_id
+           WHERE document.id = $1 AND document.superseded_at IS NULL AND document.deleted_at IS NULL
+             AND document.scan_status = 'clean' FOR UPDATE OF document`,
+          [dueDocument.id],
+        );
+        const document = selected.rows[0];
+        if (!document) return null;
+        const expiresAt = dateOnly(document.expires_at);
+        const expired = expiresAt < currentDate;
+        const noticeKind = expired ? 'expired' : 'upcoming';
+        const reminderDaysBefore = expired ? 0 : Number(dueDocument.reminder_days_before);
+        const recorded = await client.query(
+          `INSERT INTO organization_document_expiry_notices (id, document_id, notice_kind, reminder_days_before)
+           VALUES ($1, $2, $3, $4) ON CONFLICT (document_id, notice_kind, reminder_days_before) DO NOTHING RETURNING id`,
+          [randomUUID(), document.id, noticeKind, reminderDaysBefore],
+        );
+        if (!recorded.rowCount) return null;
+
+        const requirement = documentRequirementsFor(document.business_type, document.country_code).find((item) => item.type === document.document_type);
+        const isRequired = Boolean(requirement?.required);
+        let verificationReset = false;
+        if (expired && isRequired && document.business_type === 'agency') {
+          const updated = await client.query(
+            `UPDATE agency_verifications SET status = 'unsubmitted', reason = $2,
+               submitted_at = NULL, decided_at = NULL, updated_at = NOW()
+             WHERE organization_id = $1 AND status IN ('approved', 'pending') RETURNING organization_id`,
+            [document.organization_id, 'A required verification document expired. Upload a current replacement and submit for review.'],
+          );
+          if (updated.rowCount) {
+            await client.query('UPDATE organizations SET verified_at = NULL WHERE id = $1', [document.organization_id]);
+            verificationReset = true;
+          }
+        } else if (expired && isRequired) {
+          const updated = await client.query(
+            `UPDATE seller_profiles SET verification_status = 'pending',
+               verification_reason = 'A required verification document expired. Upload a current replacement for re-review.', updated_at = NOW()
+             WHERE organization_id = $1 AND verification_status = 'approved' RETURNING organization_id`,
+            [document.organization_id],
+          );
+          if (updated.rowCount) {
+            await client.query(
+              `UPDATE hotel_properties SET verification_status = 'pending', reviewed_by = NULL, reviewed_at = NULL, updated_at = NOW()
+               WHERE organization_id = $1 AND verification_status = 'approved'`,
+              [document.organization_id],
+            );
+            verificationReset = true;
+          }
+        }
+
+        const label = documentDto(document).label;
+        const eventType = expired ? 'verification_document_expired' : 'verification_document_expiring';
+        const title = expired ? 'Verification document expired' : 'Verification document expiring';
+        const message = expired
+          ? `${label} expired on ${expiresAt}. Upload a current replacement${isRequired ? ' to restore verification' : ''}.`
+          : reminderDaysBefore === 0
+            ? `${label} expires today. Upload a current replacement before it expires.`
+            : `${label} expires in ${reminderDaysBefore} day${reminderDaysBefore === 1 ? '' : 's'} on ${expiresAt}.`;
+          const data = { documentId: document.id, documentType: document.document_type, expiresAt, required: isRequired };
+        await notify(client, document.organization_id, eventType, title, message, data);
+        if (expired) {
+          await recordOrganizationEvent(client, { organizationId: document.organization_id, actorUserId: null, action: 'document.expired', details: { ...data, verificationReset } });
+        }
+        return { expired, verificationReset };
+      });
+      if (!handled) continue;
+      if (handled.expired) summary.expired += 1;
+      else summary.reminders += 1;
+      if (handled.verificationReset) summary.verificationResets += 1;
+    } catch {
+      summary.failures += 1;
+    }
+  }
+  return summary;
+}
+
+export function startDocumentExpiryWorker(pool, { intervalMs = config.documents.expiryIntervalMs, logger = console } = {}) {
+  let active = false;
+  let stopped = false;
+  const run = async () => {
+    if (active || stopped) return;
+    active = true;
+    try {
+      const result = await processDocumentExpiryReminders(pool);
+      if (result.failures) logger.error(`Document expiry reminders left ${result.failures} record(s) for the next run.`);
+    } catch {
+      logger.error('Document expiry reminder processing failed.');
+    } finally {
+      active = false;
+    }
+  };
+  const timer = setInterval(run, intervalMs);
+  timer.unref?.();
+  void run();
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
 }
 
 export function startDocumentScanWorker(pool, { storage, scanner, intervalMs = config.documents.scanIntervalMs, logger = console } = {}) {

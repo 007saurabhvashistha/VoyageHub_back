@@ -74,10 +74,14 @@ export function createOrganizationRouter({ pool }) {
     try {
       await client.query('BEGIN');
       await client.query('SELECT id FROM organizations WHERE id = $1 FOR UPDATE', [request.auth.organization_id]);
-      const existingUser = await client.query('SELECT 1 FROM users WHERE email = $1', [email]);
-      if (existingUser.rowCount) {
+      const existingMember = await client.query(
+        `SELECT 1 FROM organization_memberships membership JOIN users user_account ON user_account.id = membership.user_id
+         WHERE membership.organization_id = $1 AND user_account.email = $2`,
+        [request.auth.organization_id, email],
+      );
+      if (existingMember.rowCount) {
         await client.query('ROLLBACK');
-        return fail(response, 409, 'EMAIL_IN_USE', 'This email already has a Lead Exchange account. Joining more than one organization is not supported yet.');
+        return fail(response, 409, 'ALREADY_MEMBER', 'This person is already a member of your organization.');
       }
       await client.query(
         `UPDATE organization_invitations SET revoked_at = NOW()

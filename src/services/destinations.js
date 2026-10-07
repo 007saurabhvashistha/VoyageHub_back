@@ -202,7 +202,9 @@ export async function refreshProfileDisplayNames(client, { organizationId = null
 
 export async function sellerProfileResponse(db, organizationId) {
   const result = await db.query(
-    'SELECT coverage_destinations, property_city, property_destination_id, verification_status, verification_reason FROM seller_profiles WHERE organization_id = $1',
+    `SELECT coverage_destinations, property_city, property_destination_id, verification_status, verification_reason,
+            handled_group_types, minimum_group_size, budget_min_minor, budget_max_minor, budget_currency, languages, accepting_requests
+     FROM seller_profiles WHERE organization_id = $1`,
     [organizationId],
   );
   if (!result.rowCount) return null;
@@ -216,6 +218,13 @@ export async function sellerProfileResponse(db, organizationId) {
     propertyDestination: propertyDestination ? destinationDto(propertyDestination) : null,
     verificationStatus: profile.verification_status,
     verificationReason: profile.verification_reason,
+    handledGroupTypes: profile.handled_group_types ?? [],
+    minimumGroupSize: profile.minimum_group_size ?? null,
+    budgetMinMinor: profile.budget_min_minor == null ? null : Number(profile.budget_min_minor),
+    budgetMaxMinor: profile.budget_max_minor == null ? null : Number(profile.budget_max_minor),
+    budgetCurrency: profile.budget_currency ?? null,
+    languages: profile.languages ?? [],
+    acceptingRequests: profile.accepting_requests !== false,
   };
 }
 

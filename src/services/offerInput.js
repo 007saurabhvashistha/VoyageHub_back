@@ -22,6 +22,13 @@ const lineItemSchema = z.object({
 }).transform((item) => ({ ...item, line_total_minor: item.quantity * item.unit_price_minor }))
   .refine((item) => Number.isSafeInteger(item.line_total_minor), 'A line item total is too large.');
 
+const itineraryDaySchema = z.object({
+  day: z.number().int().min(1).max(90),
+  destination: z.string().trim().max(120).nullish().transform((value) => value || null),
+  title: z.string().trim().min(2).max(120),
+  description: optionalText(1000),
+});
+
 const commonFields = {
   currency: z.string().toUpperCase().refine(isCurrencyCode, 'Use an ISO 4217 currency code.'),
   inclusions: uniqueList(offerInclusions),
@@ -46,6 +53,7 @@ const noContactDetails = (offer) => !containsContactDetails(
   offer.cancellation_policy, offer.payment_notes, offer.option_label,
   ...(offer.line_items ?? []).map((item) => item.description),
   ...offer.options.flatMap((option) => [option.label, option.notes]),
+  ...(offer.itinerary ?? []).flatMap((day) => [day.destination, day.title, day.description]),
 );
 
 // Option names must tell the agency apart which price it is awarding.
@@ -60,6 +68,9 @@ export const landPackageOfferSchema = z.object({
   ...commonFields,
   total_minor: positiveMinorAmount,
   hotel_category: hotelCategory,
+  itinerary: z.array(itineraryDaySchema).max(90).default([])
+    .refine((days) => new Set(days.map((day) => day.day)).size === days.length, 'Use each itinerary day number once.')
+    .transform((days) => [...days].sort((left, right) => left.day - right.day)),
   line_items: z.array(lineItemSchema).max(config.maxOfferLineItems, `Use at most ${config.maxOfferLineItems} line items.`).default([]),
   options: optionList(landOptionSchema),
 }).refine((offer) => !offer.line_items.length || offer.line_items.reduce((sum, item) => sum + item.line_total_minor, 0) === offer.total_minor, {

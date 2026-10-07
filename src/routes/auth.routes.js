@@ -322,6 +322,7 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
          JOIN organizations o ON o.id = m.organization_id
          LEFT JOIN user_mfa mfa ON mfa.user_id = u.id
          WHERE u.email = $1 AND o.business_type = $2
+         ORDER BY (o.suspended_at IS NOT NULL), o.created_at, o.id
          LIMIT 1`,
         [email, businessType],
       );
@@ -701,13 +702,63 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
     }
   });
 
+  router.get('/organizations', (request, response, next) => loadSession(pool, request, response, next), (request, response, next) => requireActiveAccount(pool, request, response, next), async (request, response, next) => {
+    try {
+      const result = await pool.query(
+        `SELECT organization.id, organization.name, organization.business_type, organization.country_code, membership.access_role
+         FROM organization_memberships membership JOIN organizations organization ON organization.id = membership.organization_id
+         WHERE membership.user_id = $1 AND organization.suspended_at IS NULL AND organization.closure_scheduled_for IS NULL
+         ORDER BY organization.name, organization.id`,
+        [request.auth.user_id],
+      );
+      return response.json({ organizations: result.rows.map((row) => ({ id: row.id, name: row.name, businessType: row.business_type, countryCode: row.country_code, accessRole: row.access_role })), activeOrganizationId: request.auth.organization_id });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.post('/organizations/:organizationId/switch', (request, response, next) => loadSession(pool, request, response, next), requireCsrf, (request, response, next) => requireActiveAccount(pool, request, response, next), async (request, response, next) => {
+    if (!z.uuid().safeParse(request.params.organizationId).success) return apiError(response, 400, 'VALIDATION_ERROR', 'Choose a valid organization.');
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const target = await client.query(
+        `SELECT organization.id, organization.name, organization.business_type, organization.country_code, membership.access_role
+         FROM organization_memberships membership JOIN organizations organization ON organization.id = membership.organization_id
+         WHERE membership.user_id = $1 AND membership.organization_id = $2
+           AND organization.suspended_at IS NULL AND organization.closure_scheduled_for IS NULL
+         FOR UPDATE OF membership`,
+        [request.auth.user_id, request.params.organizationId],
+      );
+      if (!target.rowCount) {
+        await client.query('ROLLBACK');
+        return apiError(response, 404, 'ORGANIZATION_NOT_AVAILABLE', 'This organization is not available to your account.');
+      }
+      const organization = target.rows[0];
+      if (organization.id === request.auth.organization_id) {
+        await client.query('ROLLBACK');
+        return response.json({ organization: { id: organization.id, name: organization.name, businessType: organization.business_type, countryCode: organization.country_code, accessRole: organization.access_role }, csrfToken: request.auth.csrf_token });
+      }
+      const session = await saveSession(client, request.auth.user_id, organization.id);
+      await client.query('DELETE FROM auth_sessions WHERE token_hash = $1', [request.sessionTokenHash]);
+      await client.query('COMMIT');
+      createSessionCookie(response, session.token, cookieName, secureCookies);
+      return response.json({ organization: { id: organization.id, name: organization.name, businessType: organization.business_type, countryCode: organization.country_code, accessRole: organization.access_role }, csrfToken: session.csrfToken });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      return next(error);
+    } finally {
+      client.release();
+    }
+  });
+
   const invitationTokenSchema = z.string().min(20).max(200);
   const invitationAcceptSchema = z.object({
     token: invitationTokenSchema,
-    full_name: z.string().trim().min(2, 'Enter a name between 2 and 120 characters.').max(120, 'Enter a name between 2 and 120 characters.'),
-    password: z.string().min(8, 'Password must be at least 8 characters.').refine((value) => Buffer.byteLength(value, 'utf8') <= 72, 'Password must be no more than 72 bytes.'),
+    full_name: z.string().trim().min(2, 'Enter a name between 2 and 120 characters.').max(120, 'Enter a name between 2 and 120 characters.').optional(),
+    password: z.string().min(8, 'Password must be at least 8 characters.').refine((value) => Buffer.byteLength(value, 'utf8') <= 72, 'Password must be no more than 72 bytes.').optional(),
     accepted_legal_document_ids: z.array(z.uuid()).max(20).default([]),
-  });
+  }).refine((value) => Boolean(value.full_name) === Boolean(value.password), 'Provide both a name and password for a new account.');
 
   async function findPendingInvitation(db, token, lock = false) {
     const result = await db.query(
@@ -745,26 +796,80 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
         await client.query('ROLLBACK');
         return apiError(response, 404, 'INVITATION_NOT_FOUND', 'This invitation is invalid, expired, revoked or already used.');
       }
+      const sessionToken = request.cookies?.[cookieName];
+      const currentSession = sessionToken ? await client.query(
+        `SELECT session.token_hash, session.csrf_token, account.id AS user_id, account.email
+         FROM auth_sessions session JOIN users account ON account.id = session.user_id
+         JOIN organizations organization ON organization.id = session.organization_id
+         WHERE session.token_hash = $1 AND session.expires_at > NOW() AND account.email_verified_at IS NOT NULL
+           AND account.deletion_requested_at IS NULL AND organization.suspended_at IS NULL
+         LIMIT 1`,
+        [hashToken(sessionToken)],
+      ) : { rows: [] };
+      const authenticatedUser = currentSession.rows[0] ?? null;
+      if (authenticatedUser && !safeEqual(request.get('x-csrf-token'), authenticatedUser.csrf_token)) {
+        await client.query('ROLLBACK');
+        return apiError(response, 403, 'CSRF_INVALID', 'Refresh your session and try again.');
+      }
       const missing = await missingAcceptances(client, input.data.accepted_legal_document_ids, invitation.access_role);
       if (missing.length) {
         await client.query('ROLLBACK');
         return apiError(response, 400, 'LEGAL_ACCEPTANCE_REQUIRED', `Accept the current ${missing.map((row) => row.title).join(', ')} to join.`);
       }
-      const userId = randomUUID();
-      const passwordHash = await bcrypt.hash(input.data.password, passwordWorkFactor);
-      // The single-use token was issued for this address by a verified organization manager.
-      await client.query(
-        'INSERT INTO users (id, full_name, email, password_hash, email_verified_at) VALUES ($1, $2, $3, $4, NOW())',
-        [userId, input.data.full_name, invitation.email, passwordHash],
-      );
-      await client.query(
-        'INSERT INTO organization_memberships (id, organization_id, user_id, access_role) VALUES ($1, $2, $3, $4)',
-        [randomUUID(), invitation.organization_id, userId, invitation.access_role],
-      );
+      const existingUser = await client.query('SELECT id, full_name FROM users WHERE email = $1', [invitation.email]);
+      let userId;
+      let switchedSession = null;
+      if (existingUser.rowCount) {
+        if (!authenticatedUser) {
+          await client.query('ROLLBACK');
+          return apiError(response, 401, 'SIGN_IN_REQUIRED', 'Sign in to the invited account before accepting this invitation.');
+        }
+        if (authenticatedUser.user_id !== existingUser.rows[0].id) {
+          await client.query('ROLLBACK');
+          return apiError(response, 403, 'INVITATION_EMAIL_MISMATCH', 'Sign in with the email address that received this invitation.');
+        }
+        const alreadyMember = await client.query(
+          'SELECT 1 FROM organization_memberships WHERE organization_id = $1 AND user_id = $2',
+          [invitation.organization_id, authenticatedUser.user_id],
+        );
+        if (alreadyMember.rowCount) {
+          await client.query('ROLLBACK');
+          return apiError(response, 409, 'ALREADY_MEMBER', 'You are already a member of this organization.');
+        }
+        userId = authenticatedUser.user_id;
+        await client.query(
+          'INSERT INTO organization_memberships (id, organization_id, user_id, access_role) VALUES ($1, $2, $3, $4)',
+          [randomUUID(), invitation.organization_id, userId, invitation.access_role],
+        );
+        switchedSession = await saveSession(client, userId, invitation.organization_id);
+        await client.query('DELETE FROM auth_sessions WHERE token_hash = $1', [authenticatedUser.token_hash]);
+      } else {
+        if (authenticatedUser) {
+          await client.query('ROLLBACK');
+          return apiError(response, 403, 'INVITATION_EMAIL_MISMATCH', 'Sign out before creating an account for a different invitation email.');
+        }
+        if (!input.data.full_name || !input.data.password) {
+          await client.query('ROLLBACK');
+          return apiError(response, 400, 'VALIDATION_ERROR', 'Enter your name and create a password to finish account setup.');
+        }
+        userId = randomUUID();
+        const passwordHash = await bcrypt.hash(input.data.password, passwordWorkFactor);
+        // The single-use token was issued for this address by a verified organization manager.
+        await client.query(
+          'INSERT INTO users (id, full_name, email, password_hash, email_verified_at) VALUES ($1, $2, $3, $4, NOW())',
+          [userId, input.data.full_name, invitation.email, passwordHash],
+        );
+        await client.query(
+          'INSERT INTO organization_memberships (id, organization_id, user_id, access_role) VALUES ($1, $2, $3, $4)',
+          [randomUUID(), invitation.organization_id, userId, invitation.access_role],
+        );
+      }
       await client.query('UPDATE organization_invitations SET accepted_at = NOW(), accepted_user_id = $2 WHERE id = $1', [invitation.id, userId]);
       await recordAcceptances(client, { userId, organizationId: invitation.organization_id, documentIds: input.data.accepted_legal_document_ids });
       await recordOrganizationEvent(client, { organizationId: invitation.organization_id, actorUserId: userId, action: 'invitation.accepted', targetUserId: userId, details: { email: invitation.email, role: invitation.access_role } });
       await client.query('COMMIT');
+      if (switchedSession) createSessionCookie(response, switchedSession.token, cookieName, secureCookies);
+      if (switchedSession) return response.status(201).json({ email: invitation.email, user: { id: userId, fullName: existingUser.rows[0].full_name }, organization: { id: invitation.organization_id, name: invitation.organization_name, businessType: invitation.business_type, accessRole: invitation.access_role }, csrfToken: switchedSession.csrfToken, switchedOrganization: true });
       return response.status(201).json({ email: invitation.email, organizationName: invitation.organization_name, businessType: invitation.business_type, role: invitation.access_role });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
@@ -784,6 +889,56 @@ export function createAuthRouter({ pool, secureCookies, cookieName, emailDeliver
       await pool.query('DELETE FROM auth_sessions WHERE token_hash = $1', [request.sessionTokenHash]);
       response.clearCookie(cookieName, { httpOnly: true, secure: secureCookies, sameSite: 'lax', path: '/' });
       return response.status(204).end();
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.get('/sessions', (request, response, next) => loadSession(pool, request, response, next), (request, response, next) => requireActiveAccount(pool, request, response, next), async (request, response, next) => {
+    try {
+      const sessions = await pool.query(
+        `SELECT session.id, session.organization_id, organization.name AS organization_name,
+                organization.business_type, session.created_at, session.expires_at
+         FROM auth_sessions session JOIN organizations organization ON organization.id = session.organization_id
+         WHERE session.user_id = $1 AND session.expires_at > NOW()
+         ORDER BY session.created_at DESC, session.id DESC`,
+        [request.auth.user_id],
+      );
+      response.set('Cache-Control', 'private, no-store');
+      return response.json({ sessions: sessions.rows.map((session) => ({
+        id: session.id,
+        organizationId: session.organization_id,
+        organizationName: session.organization_name,
+        businessType: session.business_type,
+        createdAt: session.created_at,
+        expiresAt: session.expires_at,
+        current: session.id === request.auth.session_id,
+      })) });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.delete('/sessions/:sessionId', (request, response, next) => loadSession(pool, request, response, next), requireCsrf, (request, response, next) => requireActiveAccount(pool, request, response, next), async (request, response, next) => {
+    if (!z.uuid().safeParse(request.params.sessionId).success) return apiError(response, 400, 'VALIDATION_ERROR', 'Choose a valid session.');
+    try {
+      const removed = await pool.query(
+        'DELETE FROM auth_sessions WHERE id = $1 AND user_id = $2 RETURNING id',
+        [request.params.sessionId, request.auth.user_id],
+      );
+      if (!removed.rowCount) return apiError(response, 404, 'SESSION_NOT_FOUND', 'Active session was not found.');
+      if (request.params.sessionId === request.auth.session_id) response.clearCookie(cookieName, { httpOnly: true, secure: secureCookies, sameSite: 'lax', path: '/' });
+      return response.status(204).end();
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.post('/sessions/sign-out-everywhere', (request, response, next) => loadSession(pool, request, response, next), requireCsrf, (request, response, next) => requireActiveAccount(pool, request, response, next), async (request, response, next) => {
+    try {
+      const removed = await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [request.auth.user_id]);
+      response.clearCookie(cookieName, { httpOnly: true, secure: secureCookies, sameSite: 'lax', path: '/' });
+      return response.json({ revokedSessions: removed.rowCount });
     } catch (error) {
       return next(error);
     }

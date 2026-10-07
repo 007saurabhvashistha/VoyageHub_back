@@ -1,4 +1,5 @@
 ﻿import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +14,8 @@ import { importCountryDestinations } from '../src/services/destinationImport.js'
 import { launchRouting } from '../src/services/routing.js';
 import { processAlertDigests } from '../src/jobs/alertDigests.js';
 import { createTotpEnrollment } from '../src/services/totp.js';
+import { groupTypes, requirementTypes } from '../src/config/referenceData.js';
+import { config } from '../src/config/index.js';
 
 // Every place name in this file is synthetic; the hard rule forbids real geography in code and tests.
 const migrationDirectory = fileURLToPath(new URL('../db/migrations/', import.meta.url));
@@ -124,10 +127,16 @@ test('hard rule: hotel-only leads reach only hotels and itinerary leads reach on
   const dmc = await register(baseUrl, { role: 'dmc', coverage: [places.north.id] });
 
   const hotelLead = await publishLead(baseUrl, agency, lead({ requirement_type: 'hotel_only', services: ['hotel'], destinations: [{ destination_id: places.n1a.id }] }));
-  const itineraryLead = await publishLead(baseUrl, agency, lead({ destinations: [{ destination_id: places.n1a.id }] }));
+  const itineraryLead = await publishLead(baseUrl, agency, lead({
+    destinations: [{ destination_id: places.n1a.id }], children: 1, child_ages: [9],
+    special_requests: 'Step-free access and vegetarian meals.',
+  }));
 
   assert.deepEqual(await feedIds(baseUrl, hotel), [hotelLead.id]);
   assert.deepEqual(await feedIds(baseUrl, dmc), [itineraryLead.id]);
+  const sellerDetail = await api(baseUrl, `/v1/marketplace/requests/${itineraryLead.id}`, dmc);
+  assert.deepEqual(sellerDetail.body.request.childAges, [9]);
+  assert.equal(sellerDetail.body.request.specialRequests, 'Step-free access and vegetarian meals.');
   assert.equal((await api(baseUrl, `/v1/marketplace/requests/${itineraryLead.id}`, hotel)).response.status, 404);
   assert.equal((await api(baseUrl, `/v1/marketplace/requests/${hotelLead.id}`, dmc)).response.status, 404);
   const sneakyOffer = await api(baseUrl, `/v1/marketplace/requests/${itineraryLead.id}/offers`, hotel, {
@@ -144,6 +153,95 @@ test('hard rule: hotel-only leads reach only hotels and itinerary leads reach on
 
   const hotelNotifications = (await api(baseUrl, '/v1/notifications', hotel)).body.notifications;
   assert.ok(hotelNotifications.every((item) => item.data?.requestId !== itineraryLead.id));
+});
+
+test('DMC trip, group, budget and pause settings control future matching without hiding current requests', async (context) => {
+  const { baseUrl, places } = await startApp(context);
+  const agency = await register(baseUrl, { role: 'agency' });
+  const dmc = await register(baseUrl, { role: 'dmc', coverage: [places.north.id] });
+  const groupType = groupTypes[0].value;
+  const itineraryRequirement = requirementTypes.find((type) => type.audience === 'dmc').value;
+  const otherGroupType = groupTypes.find((type) => type.value !== groupType).value;
+  const settings = {
+    accepting_requests: true,
+    handled_group_types: [groupType],
+    minimum_group_size: 3,
+    budget_min_minor: 15000,
+    budget_max_minor: 30000,
+    budget_currency: config.defaultCurrency,
+    languages: ['en', 'fr'],
+  };
+  const saved = await api(baseUrl, '/v1/marketplace/seller-settings', dmc, { method: 'PUT', body: settings });
+  assert.equal(saved.response.status, 200, JSON.stringify(saved.body));
+  assert.equal(saved.body.verificationStatus, 'approved');
+  assert.deepEqual(saved.body.languages, ['en', 'fr']);
+
+  const preview = (adults) => api(baseUrl, '/v1/marketplace/requests/audience-preview', agency, { method: 'POST', body: {
+    requirement_type: itineraryRequirement, destinations: [{ destination_id: places.n1a.id }], group_type: groupType, adults,
+    children: 0, infants: 0, budget_min_minor: 10000, budget_max_minor: 25000, budget_currency: config.defaultCurrency,
+  } });
+  assert.equal((await preview(2)).body.sellers, 0);
+  assert.equal((await preview(3)).body.sellers, 1);
+
+  const publish = (overrides) => publishLead(baseUrl, agency, lead({
+    group_type: groupType,
+    budget_min_minor: 10000,
+    budget_max_minor: 25000,
+    budget_currency: config.defaultCurrency,
+    destinations: [{ destination_id: places.n1a.id }],
+    ...overrides,
+  }));
+  const tooSmall = await publish({ adults: 2 });
+  assert.deepEqual(await feedIds(baseUrl, dmc), []);
+  const matching = await publish({ adults: 3 });
+  assert.deepEqual(await feedIds(baseUrl, dmc), [matching.id]);
+  await publish({ adults: 3, group_type: otherGroupType });
+  await publish({ adults: 3, budget_min_minor: 40000, budget_max_minor: 50000 });
+  assert.deepEqual(await feedIds(baseUrl, dmc), [matching.id]);
+
+  await api(baseUrl, '/v1/marketplace/seller-settings', dmc, { method: 'PUT', body: { ...settings, accepting_requests: false } });
+  assert.deepEqual(await feedIds(baseUrl, dmc), [matching.id]);
+  const supplierDirectory = await api(baseUrl, '/v1/marketplace/suppliers', agency);
+  assert.ok(!supplierDirectory.body.suppliers.some((supplier) => supplier.organizationId === dmc.organizationId));
+  const pausedInvite = await api(baseUrl, '/v1/marketplace/requests', agency, { method: 'POST', body: lead({
+    destinations: [{ destination_id: places.n1a.id }], visibility: 'invite_only', invited_seller_ids: [dmc.organizationId],
+  }) });
+  assert.equal(pausedInvite.body.error.code, 'INVALID_INVITATION');
+  const paused = await publish({ adults: 3 });
+  assert.deepEqual(await feedIds(baseUrl, dmc), [matching.id]);
+  await api(baseUrl, '/v1/marketplace/seller-settings', dmc, { method: 'PUT', body: settings });
+  assert.deepEqual((await feedIds(baseUrl, dmc)).sort(), [matching.id, paused.id].sort());
+  assert.ok(!tooSmall.id || !(await feedIds(baseUrl, dmc)).includes(tooSmall.id));
+});
+
+test('hotel matching checks every requested night and the requested room count when inventory is configured', async (context) => {
+  const { pool, baseUrl, places } = await startApp(context);
+  const agency = await register(baseUrl, { role: 'agency' });
+  const hotel = await register(baseUrl, { role: 'hotelier', property: places.n1a.id });
+  for (let night = 0; night < 4; night += 1) {
+    const date = new Date(Date.parse('2027-05-01T00:00:00Z') + night * 86400000).toISOString().slice(0, 10);
+    await pool.query(
+      `INSERT INTO hotel_room_inventory (id, organization_id, inventory_date, room_type, available_rooms, currency)
+       VALUES ($1, $2, $3, 'Standard', 2, $4)`,
+      [randomUUID(), hotel.organizationId, date, config.defaultCurrency],
+    );
+  }
+  const publish = (overrides) => publishLead(baseUrl, agency, lead({
+    requirement_type: 'hotel_only', services: ['hotel'], destinations: [{ destination_id: places.n1a.id }], room_count: 2, ...overrides,
+  }));
+  const matching = await publish({});
+  assert.deepEqual(await feedIds(baseUrl, hotel), [matching.id]);
+  const hotelRequirement = requirementTypes.find((type) => type.audience === 'hotelier').value;
+  const preview = (roomCount, travelStartDate = '2027-05-01', travelEndDate = '2027-05-05') => api(baseUrl, '/v1/marketplace/requests/audience-preview', agency, { method: 'POST', body: {
+    requirement_type: hotelRequirement, destinations: [{ destination_id: places.n1a.id }], group_type: groupTypes[0].value,
+    adults: 2, children: 0, infants: 0, travel_start_date: travelStartDate, travel_end_date: travelEndDate, nights: 4, room_count: roomCount,
+  } });
+  assert.equal((await preview(2)).body.sellers, 1);
+  assert.equal((await preview(3)).body.sellers, 0);
+  assert.equal((await preview(2, '2027-05-06', '2027-05-10')).body.sellers, 0);
+  await publish({ room_count: 3 });
+  await publish({ travel_start_date: '2027-05-06', travel_end_date: '2027-05-10' });
+  assert.deepEqual(await feedIds(baseUrl, hotel), [matching.id]);
 });
 
 test('lead type is validated and locked after publishing; repost switches type', async (context) => {
@@ -287,6 +385,13 @@ test('destination changes re-route the lead and alert preferences control instan
   const mutedDmc = await register(baseUrl, { role: 'dmc', coverage: [places.s1.id] });
   assert.equal((await api(baseUrl, '/v1/alert-preferences', digestDmc, { method: 'PUT', body: { delivery: 'digest' } })).response.status, 200);
   assert.equal((await api(baseUrl, '/v1/alert-preferences', mutedDmc, { method: 'PUT', body: { delivery: 'off' } })).response.status, 200);
+  for (const seller of [southDmc, digestDmc, mutedDmc]) {
+    await pool.query(
+      `INSERT INTO webhook_endpoints (id, organization_id, url, event_types, secret_ciphertext)
+       VALUES ($1, $2, 'https://crm.example.test/hooks', ARRAY['request_matched']::text[], 'test-ciphertext')`,
+      [randomUUID(), seller.organizationId],
+    );
+  }
 
   const moving = await publishLead(baseUrl, agency, lead({ destinations: [{ destination_id: places.n1a.id }] }));
   const changed = await api(baseUrl, `/v1/marketplace/requests/${moving.id}/trip`, agency, {
@@ -304,6 +409,26 @@ test('destination changes re-route the lead and alert preferences control instan
   assert.ok(!(await events(digestDmc)).includes('request_matched'));
   assert.ok(!(await events(mutedDmc)).includes('request_matched'));
   assert.ok((await feedIds(baseUrl, mutedDmc)).includes(moving.id), 'muted sellers still see the lead in the feed');
+
+  const matchNotification = await pool.query(
+    `SELECT data FROM notifications WHERE organization_id = $1 AND event_type = 'request_matched'
+     AND data->>'requestId' = $2 ORDER BY created_at DESC LIMIT 1`,
+    [southDmc.organizationId, moving.id],
+  );
+  const leadSnapshot = matchNotification.rows[0].data.leadSnapshot;
+  assert.equal(leadSnapshot.travelStartDate, changed.body.request.travelStartDate);
+  assert.equal(leadSnapshot.destinations[0].name, 'Spot S1a');
+  assert.equal('guestEmail' in leadSnapshot, false);
+  assert.equal('guestPhone' in leadSnapshot, false);
+
+  const webhookDeliveries = await pool.query(
+    `SELECT organization_id, payload FROM webhook_deliveries
+     WHERE event_type = 'request_matched' AND payload->'data'->>'requestId' = $1`,
+    [moving.id],
+  );
+  assert.equal(webhookDeliveries.rowCount, 3, 'CRM endpoints receive matches regardless of in-app alert preference');
+  assert.deepEqual(new Set(webhookDeliveries.rows.map((row) => row.organization_id)), new Set([southDmc.organizationId, digestDmc.organizationId, mutedDmc.organizationId]));
+  assert.ok(webhookDeliveries.rows.every((row) => row.payload.data.leadSnapshot.destinations[0].name === 'Spot S1a'));
 
   await pool.query("UPDATE alert_digest_items SET queued_at = NOW() - INTERVAL '2 days'");
   const digests = await processAlertDigests(pool);

@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { config, countryList, currencyList, isCountryCode } from '../config/index.js';
-import { agencyVerificationStatuses, alertDeliveryModes, bookingChangeStatuses, bookingChangeTypes, bookingStatuses, businessTypes, comparisonLabels, coverageModes, destinationKinds, destinationParentKinds, documentScanStatuses, groupTypes, guestAccessActions, hotelCategories, hotelPropertyStatuses, legalDocumentTypes, matchTypes, mealPlans, memberRoles, negotiationKinds, negotiationStatuses, offerInclusions, offerLineItemTypes, operationRunKinds, reportCategories, reportTargetTypes, requestVisibilities, requirementTypes, serviceTypes, travellerTypes, verificationDocumentTypes, webhookDeliveryStatuses, webhookEventTypes } from '../config/referenceData.js';
+import { agencyVerificationStatuses, alertDeliveryModes, bookingChangeStatuses, bookingChangeTypes, bookingRatingScale, bookingStatuses, businessTypes, comparisonLabels, coverageModes, destinationKinds, destinationParentKinds, documentScanStatuses, groupTypes, guestAccessActions, hotelCategories, hotelFacilities, hotelOwnershipCheckStatuses, hotelPropertyStatuses, hotelRoomHoldStatuses, legalDocumentTypes, matchTypes, mealPlans, memberRoles, negotiationKinds, negotiationStatuses, offerInclusions, offerLineItemTypes, operationRunKinds, reportCategories, reportTargetTypes, requestVisibilities, requirementTypes, serviceTypes, travellerTypes, verificationDocumentTypes, webhookDeliveryStatuses, webhookEventTypes } from '../config/referenceData.js';
 import { destinationDto, listChildren, listCountryRoots, loadLevelLabels, searchDestinations } from '../services/destinations.js';
 import { propertyDestinationKinds } from '../services/hotelProperties.js';
 import { getMaxOffersPerRequest, getSetting } from '../services/platformSettings.js';
@@ -31,6 +31,9 @@ export function createReferenceDataRouter({ pool, cookieName }) {
     matchTypes,
     alertDeliveryModes,
     hotelPropertyStatuses,
+    hotelOwnershipCheckStatuses,
+    hotelFacilities,
+    hotelRoomHoldStatuses,
     hotelPropertyDestinationKinds: propertyDestinationKinds,
     offerInclusions,
     offerLineItemTypes,
@@ -48,6 +51,7 @@ export function createReferenceDataRouter({ pool, cookieName }) {
     documentScanStatuses,
     agencyVerificationStatuses,
     bookingStatuses,
+    bookingRatingScale,
     bookingChangeTypes,
     bookingChangeStatuses,
     travellerTypes,
@@ -112,15 +116,24 @@ export function createReferenceDataRouter({ pool, cookieName }) {
   router.get('/', async (_request, response, next) => {
     try {
       const maxOffersPerRequest = pool ? await getMaxOffersPerRequest(pool) : null;
+      const monetization = pool ? {
+        subscriptions: await getSetting(pool, 'monetization_subscriptions_enabled'),
+        credits: await getSetting(pool, 'monetization_credits_enabled'),
+        commission: await getSetting(pool, 'monetization_commission_enabled'),
+        featuredListings: await getSetting(pool, 'monetization_featured_listings_enabled'),
+      } : { subscriptions: false, credits: false, commission: false, featuredListings: false };
       const routingLimits = pool ? {
         maxRequestDestinations: await getSetting(pool, 'max_request_destinations'),
         hotelLeadAllowedDestinationKinds: await getSetting(pool, 'hotel_lead_allowed_destination_kinds'),
         maxOffersPerHotelOrgPerRequest: await getSetting(pool, 'max_offers_per_hotel_org_per_request'),
         maxHotelPropertiesPerOrganization: await getSetting(pool, 'max_hotel_properties_per_organization'),
+          maxHotelPropertyPhotos: config.hotels.maxPropertyPhotos,
+          maxHotelRoomTypes: config.hotels.maxRoomTypes,
       } : {};
       response.set('cache-control', 'private, max-age=300');
       return response.json({
         ...staticData,
+        monetization,
         limits: {
           maxInvitedSuppliers: config.maxInvitedSuppliers,
           maxOffersPerRequest,

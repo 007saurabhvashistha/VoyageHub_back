@@ -16,6 +16,10 @@ export function isCurrencyCode(value) {
 }
 
 const positiveInt = (fallback) => z.coerce.number().int().positive().default(fallback);
+const nonNegativeIntList = (fallback) => z.string().default(fallback)
+  .transform((value) => value.split(',').map((item) => Number(item.trim())))
+  .pipe(z.array(z.number().int().nonnegative()).min(1))
+  .refine((values) => new Set(values).size === values.length, 'Reminder day offsets must be unique.');
 const optionalText = (max) => z.string().trim().min(1).max(max).optional();
 const mimeTypeList = z.string().transform((value) => value.split(',').map((item) => item.trim().toLowerCase()).filter(Boolean))
   .pipe(z.array(z.string().regex(/^[a-z]+\/[a-z0-9.+-]+$/, 'DOCUMENT_ALLOWED_MIME_TYPES must be a comma-separated list of MIME types')).min(1));
@@ -44,6 +48,8 @@ const envSchema = z.object({
   AWARD_UNDO_WINDOW_MINUTES: positiveInt(15),
   BOOKING_CHANGE_MAX_NIGHTS: positiveInt(90),
   BOOKING_CHANGE_MAX_ROOMS: positiveInt(50),
+  HOTEL_ROOM_HOLD_MINUTES: positiveInt(30),
+  MAX_HOTEL_PROPERTY_PHOTOS: positiveInt(10),
   REMINDER_DEADLINE_HOURS: positiveInt(24),
   REMINDER_OFFER_EXPIRY_HOURS: positiveInt(48),
   REMINDER_JOB_INTERVAL_SECONDS: positiveInt(300),
@@ -115,6 +121,9 @@ const envSchema = z.object({
   DOCUMENT_DOWNLOAD_URL_TTL_SECONDS: positiveInt(300),
   DOCUMENT_SCAN_JOB_INTERVAL_SECONDS: positiveInt(30),
   DOCUMENT_SCAN_MAX_ATTEMPTS: positiveInt(8),
+  DOCUMENT_EXPIRY_REMINDER_DAYS: nonNegativeIntList('30,7,0'),
+  DOCUMENT_EXPIRY_JOB_INTERVAL_SECONDS: positiveInt(3600),
+  DOCUMENT_EXPIRY_BATCH_SIZE: positiveInt(100),
   REJECTED_DOCUMENT_RETENTION_DAYS: positiveInt(90),
   CLOSED_ORGANIZATION_DOCUMENT_RETENTION_DAYS: positiveInt(365),
   GUEST_DATA_SELLER_ACCESS_DAYS: positiveInt(30),
@@ -135,6 +144,12 @@ const envSchema = z.object({
   WEBHOOK_DELIVERY_RETENTION_DAYS: positiveInt(30),
   WEBHOOK_JOB_INTERVAL_SECONDS: positiveInt(5),
   WEBHOOK_MANAGE_RATE_LIMIT_PER_HOUR: positiveInt(30),
+  API_TOKEN_MAX_PER_ORGANIZATION: positiveInt(10),
+  API_TOKEN_TTL_DAYS: positiveInt(90),
+  PUBLIC_API_MAX_PAGE_SIZE: positiveInt(100),
+  PUBLIC_API_RATE_LIMIT_PER_MINUTE: positiveInt(120),
+  ADMIN_AUDIT_MAX_PAGE_SIZE: positiveInt(100),
+  ADMIN_AUDIT_MAX_OFFSET: positiveInt(100000),
   WEBHOOK_ALLOW_INSECURE_URLS: z.stringbool().default(false),
   BACKUP_DIRECTORY: z.string().trim().min(1).default('.backups'),
   BACKUP_KEY_PREFIX: z.string().trim().regex(/^[a-z0-9][a-z0-9/_-]{0,99}$/, 'BACKUP_KEY_PREFIX may use lowercase letters, digits, /, _ and -').default('database-backups'),
@@ -212,6 +227,11 @@ export function loadConfig(env = process.env) {
       maxNights: parsed.BOOKING_CHANGE_MAX_NIGHTS,
       maxRooms: parsed.BOOKING_CHANGE_MAX_ROOMS,
     },
+    hotels: {
+      roomHoldMinutes: parsed.HOTEL_ROOM_HOLD_MINUTES,
+      maxPropertyPhotos: parsed.MAX_HOTEL_PROPERTY_PHOTOS,
+      maxRoomTypes: 30,
+    },
     reminders: {
       deadlineHours: parsed.REMINDER_DEADLINE_HOURS,
       offerExpiryHours: parsed.REMINDER_OFFER_EXPIRY_HOURS,
@@ -229,6 +249,7 @@ export function loadConfig(env = process.env) {
       documentUpload: { windowMs: 3600000, limit: parsed.DOCUMENT_UPLOAD_RATE_LIMIT_PER_HOUR },
       guestDetailsView: { windowMs: 3600000, limit: parsed.GUEST_DETAILS_VIEW_RATE_LIMIT_PER_HOUR },
       webhookManage: { windowMs: 3600000, limit: parsed.WEBHOOK_MANAGE_RATE_LIMIT_PER_HOUR },
+      publicApi: { windowMs: 60000, limit: parsed.PUBLIC_API_RATE_LIMIT_PER_MINUTE },
     },
     storage: storageConfig(parsed),
     malwareScanner: parsed.MALWARE_SCANNER
@@ -241,6 +262,9 @@ export function loadConfig(env = process.env) {
       downloadUrlTtlSeconds: parsed.DOCUMENT_DOWNLOAD_URL_TTL_SECONDS,
       scanIntervalMs: parsed.DOCUMENT_SCAN_JOB_INTERVAL_SECONDS * 1000,
       scanMaxAttempts: parsed.DOCUMENT_SCAN_MAX_ATTEMPTS,
+      expiryReminderDays: parsed.DOCUMENT_EXPIRY_REMINDER_DAYS,
+      expiryIntervalMs: parsed.DOCUMENT_EXPIRY_JOB_INTERVAL_SECONDS * 1000,
+      expiryBatchSize: parsed.DOCUMENT_EXPIRY_BATCH_SIZE,
       retention: {
         rejectedDays: parsed.REJECTED_DOCUMENT_RETENTION_DAYS,
         closedOrganizationDays: parsed.CLOSED_ORGANIZATION_DOCUMENT_RETENTION_DAYS,
@@ -270,6 +294,15 @@ export function loadConfig(env = process.env) {
       deliveryRetentionDays: parsed.WEBHOOK_DELIVERY_RETENTION_DAYS,
       intervalMs: parsed.WEBHOOK_JOB_INTERVAL_SECONDS * 1000,
       allowInsecureUrls: parsed.WEBHOOK_ALLOW_INSECURE_URLS,
+    },
+    apiTokens: {
+      maxPerOrganization: parsed.API_TOKEN_MAX_PER_ORGANIZATION,
+      ttlDays: parsed.API_TOKEN_TTL_DAYS,
+      maxPageSize: parsed.PUBLIC_API_MAX_PAGE_SIZE,
+    },
+    adminAudit: {
+      maxPageSize: parsed.ADMIN_AUDIT_MAX_PAGE_SIZE,
+      maxOffset: parsed.ADMIN_AUDIT_MAX_OFFSET,
     },
     operations: {
       backupDirectory: parsed.BACKUP_DIRECTORY,

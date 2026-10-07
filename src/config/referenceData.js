@@ -26,6 +26,20 @@ export const mealPlans = [
 
 export const hotelCategories = [3, 4, 5].map((stars) => ({ value: stars, label: `${stars} star` }));
 
+export const hotelFacilities = [
+  { value: 'wifi', label: 'Wi-Fi' },
+  { value: 'air_conditioning', label: 'Air conditioning' },
+  { value: 'pool', label: 'Swimming pool' },
+  { value: 'fitness', label: 'Fitness centre' },
+  { value: 'spa', label: 'Spa' },
+  { value: 'restaurant', label: 'Restaurant' },
+  { value: 'parking', label: 'Parking' },
+  { value: 'airport_transfer', label: 'Airport transfer' },
+  { value: 'accessible', label: 'Accessible facilities' },
+  { value: 'family', label: 'Family facilities' },
+  { value: 'business', label: 'Business facilities' },
+];
+
 // allowedFor: the requirement types a service may appear in; a hotel-only lead can ask only for hotel services.
 export const serviceTypes = [
   { value: 'hotel', label: 'Hotel', allowedFor: ['hotel_only', 'itinerary'] },
@@ -59,10 +73,26 @@ export const alertDeliveryModes = [
   { value: 'off', label: 'No alerts (feed only)' },
 ];
 
+export const bookingRatingScale = { minimum: 1, maximum: 5 };
+
 export const hotelPropertyStatuses = [
   { value: 'pending', label: 'Awaiting review' },
   { value: 'approved', label: 'Approved' },
   { value: 'rejected', label: 'Rejected' },
+];
+
+export const hotelRoomHoldStatuses = [
+  { value: 'held', label: 'Held until agency confirmation' },
+  { value: 'confirmed', label: 'Booking confirmed' },
+  { value: 'booked', label: 'Seller confirmed' },
+  { value: 'released', label: 'Released' },
+  { value: 'expired', label: 'Expired' },
+];
+
+export const hotelOwnershipCheckStatuses = [
+  { value: 'pending', label: 'Awaiting hotel review' },
+  { value: 'verified', label: 'Ownership evidence reviewed' },
+  { value: 'rejected', label: 'Ownership evidence rejected' },
 ];
 
 export const audienceFor = (requirementType) => requirementTypes.find((item) => item.value === requirementType)?.audience ?? null;

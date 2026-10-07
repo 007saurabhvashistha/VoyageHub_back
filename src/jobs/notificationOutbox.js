@@ -58,8 +58,11 @@ export async function processNotificationOutbox(pool, {
 
     try {
       const destination = await pool.query(
-        `SELECT recipient.email, recipient.email_verified_at, notification.title, notification.message, notification.data
+        `SELECT recipient.email, recipient.email_verified_at, notification.title, notification.message, notification.data,
+          COALESCE(preference.email_enabled, TRUE) AS email_enabled,
+          COALESCE(preference.email_frequency, 'instant') AS email_frequency
          FROM users recipient CROSS JOIN notifications notification
+         LEFT JOIN user_notification_preferences preference ON preference.user_id = recipient.id
          WHERE recipient.id = $1 AND notification.id = $2`,
         [item.recipient_user_id, item.notification_id],
       );
@@ -74,6 +77,16 @@ export async function processNotificationOutbox(pool, {
         continue;
       }
       const notification = destination.rows[0];
+      const accountActionEmail = ['email_verification', 'password_recovery'].includes(item.event_type);
+      if (!accountActionEmail && (!notification.email_enabled || (item.event_type === 'daily_summary' ? notification.email_frequency !== 'daily' : notification.email_frequency === 'daily'))) {
+        await pool.query(
+          `UPDATE notification_outbox SET status = 'suppressed', locked_at = NULL,
+             last_error_code = 'user_preference', updated_at = $2 WHERE id = $1`,
+          [item.id, now()],
+        );
+        result.suppressed = (result.suppressed ?? 0) + 1;
+        continue;
+      }
       if (!notification.email_verified_at && !item.allow_unverified) {
         await pool.query(
           `UPDATE notification_outbox SET status = 'blocked_config', locked_at = NULL,

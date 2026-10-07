@@ -13,8 +13,11 @@ import { createBookingRouter } from './routes/booking.routes.js';
 import { createWebhookRouter } from './routes/webhook.routes.js';
 import { createAttachmentRouter } from './routes/attachment.routes.js';
 import { createAlertPreferenceRouter, createHotelPropertyRouter } from './routes/hotelProperties.routes.js';
+import { createTrustRouter } from './routes/trust.routes.js';
+import { createApiTokenRouter, createPublicApiRouter } from './routes/publicApi.routes.js';
+import { createReportsRouter } from './routes/reports.routes.js';
 
-export function createApp({ pool = null, secureCookies = process.env.NODE_ENV === 'production', cookieName = process.env.SESSION_COOKIE_NAME ?? 'lead_exchange_session', emailDelivery = null, tokenEncryptionKey = null, mfaEncryptionKey = null, storage = null, guestDataEncryptionKey = null, webhookEncryptionKey = null, webhookAllowInsecureUrls = undefined, emailVerificationRequired = undefined, comparisonRateFetch = globalThis.fetch } = {}) {
+export function createApp({ pool = null, secureCookies = process.env.NODE_ENV === 'production', cookieName = process.env.SESSION_COOKIE_NAME ?? 'lead_exchange_session', emailDelivery = null, tokenEncryptionKey = null, mfaEncryptionKey = null, storage = null, guestDataEncryptionKey = null, webhookEncryptionKey = null, webhookAllowInsecureUrls = undefined, emailVerificationRequired = undefined, comparisonRateFetch = globalThis.fetch, crmItineraryCreate = undefined } = {}) {
   const app = express();
 
   app.disable('x-powered-by');
@@ -44,7 +47,7 @@ export function createApp({ pool = null, secureCookies = process.env.NODE_ENV ==
   });
 
   app.use('/v1/auth', createAuthRouter({ pool, secureCookies, cookieName, emailDelivery, tokenEncryptionKey, mfaEncryptionKey, emailVerificationRequired }));
-  app.use('/v1/marketplace', createMarketplaceRouter({ pool, comparisonRateFetch }));
+  app.use('/v1/marketplace', createMarketplaceRouter({ pool, storage, comparisonRateFetch, crmItineraryCreate }));
   app.use('/v1/admin', createAdminRouter({ pool, storage }));
   app.use('/v1/notifications', createNotificationRouter({ pool }));
   app.use('/v1/organization', createOrganizationRouter({ pool }));
@@ -53,10 +56,14 @@ export function createApp({ pool = null, secureCookies = process.env.NODE_ENV ==
   app.use('/v1/legal', createLegalRouter({ pool }));
   app.use('/v1/verification-documents', createVerificationDocumentsRouter({ pool, storage }));
   app.use('/v1/bookings', createBookingRouter({ pool, storage, guestDataEncryptionKey }));
+  app.use('/v1/trust', createTrustRouter({ pool }));
   app.use('/v1/attachments', createAttachmentRouter({ pool, storage }));
-  app.use('/v1/hotel-properties', createHotelPropertyRouter({ pool }));
+  app.use('/v1/hotel-properties', createHotelPropertyRouter({ pool, storage }));
   app.use('/v1/alert-preferences', createAlertPreferenceRouter({ pool }));
   app.use('/v1/webhooks', createWebhookRouter({ pool, encryptionKey: webhookEncryptionKey, allowInsecureUrls: webhookAllowInsecureUrls }));
+  app.use('/v1/integrations/api-tokens', createApiTokenRouter({ pool }));
+  app.use('/v1/public', createPublicApiRouter({ pool }));
+  app.use('/v1/reports', createReportsRouter({ pool }));
 
   app.use((_request, response) => {
     response.status(404).json({

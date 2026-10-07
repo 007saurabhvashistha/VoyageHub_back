@@ -15,6 +15,7 @@ import { processWebhookDeliveries, processWebhookDeliveryRetention } from '../sr
 import { captureManifest, compareManifests, pgEnvironment, sameDatabase } from '../src/services/databaseBackup.js';
 import { createTotpEnrollment } from '../src/services/totp.js';
 import { webhookUrlProblem } from '../src/services/webhooks.js';
+import { groupTypes, requirementTypes, serviceTypes } from '../src/config/referenceData.js';
 
 const migrationDirectory = fileURLToPath(new URL('../db/migrations/', import.meta.url));
 const migrations = await Promise.all((await readdir(migrationDirectory)).filter((name) => name.endsWith('.sql')).sort()
@@ -208,6 +209,183 @@ test('signed webhooks are delivered, verified, rotated, retried, disabled and re
   const removed = await api(baseUrl, agency, `/v1/webhooks/endpoints/${endpointId}`, { method: 'DELETE' });
   assert.equal(removed.status, 204);
   assert.equal((await pool.query('SELECT 1 FROM webhook_deliveries WHERE endpoint_id = $1', [endpointId])).rowCount, 0);
+});
+
+test('public read API tokens are one-time secrets, tenant-scoped, and revocable', async (context) => {
+  const { pool, baseUrl } = await startApp(context);
+  const firstAgency = await registerAgency(baseUrl, pool, 'api-first@agency.example');
+  const secondAgency = await registerAgency(baseUrl, pool, 'api-second@agency.example');
+  const firstRequestId = randomUUID();
+  const secondRequestId = randomUUID();
+  for (const [id, agency, code] of [
+    [firstRequestId, firstAgency, 'API-1001'],
+    [secondRequestId, secondAgency, 'API-1002'],
+  ]) {
+    await pool.query(
+      `INSERT INTO marketplace_requests (id, request_code, agency_organization_id, destination, destination_country,
+         travel_start_date, travel_end_date, nights, adults, group_type, services, requirement_type, response_deadline, status, published_at)
+       VALUES ($1, $2, $3, $4, $5, '2027-04-01', '2027-04-04', 3, 2, 'friends', ARRAY['sightseeing']::text[], 'itinerary', NOW() + INTERVAL '2 days', 'open', NOW())`,
+      [id, code, agency.organizationId, `API fixture ${id}`, config.defaultCountry],
+    );
+  }
+
+  const noToken = await fetch(`${baseUrl}/v1/public/marketplace/requests`);
+  assert.equal(noToken.status, 401);
+  const created = await api(baseUrl, firstAgency, '/v1/integrations/api-tokens', { method: 'POST', body: { name: 'CRM read access' } });
+  assert.equal(created.status, 201);
+  assert.match(created.body.token, /^vh_live_[A-Za-z0-9_-]{43}$/);
+  const listed = await api(baseUrl, firstAgency, '/v1/integrations/api-tokens');
+  assert.equal(JSON.stringify(listed.body).includes(created.body.token), false);
+  assert.equal(listed.body.tokens[0].name, 'CRM read access');
+
+  const read = await fetch(`${baseUrl}/v1/public/marketplace/requests?limit=1`, { headers: { authorization: `Bearer ${created.body.token}` } });
+  assert.equal(read.status, 200);
+  const readBody = await read.json();
+  assert.equal(readBody.pagination.total, 1);
+  assert.equal(readBody.items[0].id, firstRequestId);
+  assert.equal(readBody.items[0].request_code, 'API-1001');
+
+  const revoked = await api(baseUrl, firstAgency, `/v1/integrations/api-tokens/${created.body.apiToken.id}`, { method: 'DELETE' });
+  assert.equal(revoked.status, 204);
+  const afterRevoke = await fetch(`${baseUrl}/v1/public/marketplace/requests`, { headers: { authorization: `Bearer ${created.body.token}` } });
+  assert.equal(afterRevoke.status, 401);
+});
+
+test('reports are role-scoped, date-filterable, and admin analytics require MFA', async (context) => {
+  const { pool, baseUrl } = await startApp(context);
+  const agency = await registerAgency(baseUrl, pool, 'reports-agency@agency.example');
+  const agencyReport = await api(baseUrl, agency, '/v1/reports/agency');
+  assert.equal(agencyReport.status, 200);
+  assert.deepEqual(agencyReport.body.metrics, {
+    requestsCount: 0,
+    offersReceived: 0,
+    respondedRequests: 0,
+    awardRatePercent: null,
+    responseTimeMinutes: null,
+    savingsByCurrency: [],
+  });
+  const invalidRange = await api(baseUrl, agency, '/v1/reports/agency?from=not-a-date');
+  assert.equal(invalidRange.status, 400);
+
+  const seller = await registerAgency(baseUrl, pool, 'reports-seller@seller.example');
+  await pool.query("UPDATE organizations SET business_type = 'dmc' WHERE id = $1", [seller.organizationId]);
+  const splitSeller = await registerAgency(baseUrl, pool, 'reports-split-seller@seller.example');
+  await pool.query("UPDATE organizations SET business_type = 'dmc' WHERE id = $1", [splitSeller.organizationId]);
+  const requestIds = [randomUUID(), randomUUID()];
+  const offerIds = [randomUUID(), randomUUID()];
+  const awardId = randomUUID();
+  const splitOfferId = randomUUID();
+  const splitAwardId = randomUUID();
+  for (const [index, requestId] of requestIds.entries()) {
+    await pool.query(
+      `INSERT INTO marketplace_requests (id, request_code, agency_organization_id, destination, destination_country,
+         travel_start_date, travel_end_date, nights, adults, group_type, services, requirement_type,
+         budget_min_minor, budget_max_minor, budget_currency, response_deadline, status, published_at)
+       VALUES ($1, $2, $3, $4, $5, '2027-04-01', '2027-04-04', 3, 2, $6, $7, $8, 50000, 100000, $9,
+         NOW() + INTERVAL '2 days', $10, NOW() - INTERVAL '1 hour')`,
+      [requestId, `AN-${index}`, agency.organizationId, `Analytics fixture ${requestId}`, config.defaultCountry,
+        groupTypes[0].value, [serviceTypes[0].value], requirementTypes.find((item) => item.value === 'itinerary').value,
+        config.defaultCurrency, index === 0 ? 'awarded' : 'open'],
+    );
+    await pool.query(
+      `INSERT INTO offers (id, request_id, seller_organization_id, offer_kind, total_minor, currency, validity_until, status, outcome_reason, created_at)
+       VALUES ($1, $2, $3, 'land_package', 80000, $4, NOW() + INTERVAL '5 days', $5, $6, NOW() - $7::interval)`,
+      [offerIds[index], requestId, seller.organizationId, config.defaultCurrency,
+        index === 0 ? 'accepted' : 'rejected', index === 0 ? null : 'Pricing mismatch', index === 0 ? '50 minutes' : '40 minutes'],
+    );
+  }
+  await pool.query(
+    `INSERT INTO awards (id, request_id, offer_id, agency_organization_id, seller_organization_id, status, created_at, booking_confirmed_at)
+     VALUES ($1, $2, $3, $4, $5, 'booked', NOW() - INTERVAL '45 minutes', NOW() - INTERVAL '5 minutes')`,
+    [awardId, requestIds[0], offerIds[0], agency.organizationId, seller.organizationId],
+  );
+  await pool.query(
+    `INSERT INTO offers (id, request_id, seller_organization_id, offer_kind, total_minor, currency, validity_until, status)
+     VALUES ($1, $2, $3, 'land_package', 10000, $4, NOW() + INTERVAL '5 days', 'accepted')`,
+    [splitOfferId, requestIds[0], splitSeller.organizationId, config.defaultCurrency],
+  );
+  await pool.query(
+    `INSERT INTO awards (id, request_id, offer_id, agency_organization_id, seller_organization_id, status)
+     VALUES ($1, $2, $3, $4, $5, 'awarded')`,
+    [splitAwardId, requestIds[0], splitOfferId, agency.organizationId, splitSeller.organizationId],
+  );
+  await pool.query(
+    'INSERT INTO organization_reviews (id, award_id, reviewer_organization_id, reviewee_organization_id, rating) VALUES ($1, $2, $3, $4, 5)',
+    [randomUUID(), awardId, agency.organizationId, seller.organizationId],
+  );
+  const sellerReport = await api(baseUrl, seller, '/v1/reports/seller');
+  assert.equal(sellerReport.status, 200);
+  assert.equal(sellerReport.body.metrics.decidedOffers, 2);
+  assert.equal(sellerReport.body.metrics.wins, 1);
+  assert.equal(sellerReport.body.metrics.winRatePercent, 50);
+  assert.equal(sellerReport.body.metrics.responseTimeMinutes, 15);
+  assert.equal(sellerReport.body.metrics.averageRating, 5);
+  assert.deepEqual(sellerReport.body.metrics.lostReasons, [{ reason: 'Pricing mismatch', count: 1 }]);
+  const populatedAgencyReport = await api(baseUrl, agency, '/v1/reports/agency');
+  assert.equal(populatedAgencyReport.body.metrics.requestsCount, 2);
+  assert.equal(populatedAgencyReport.body.metrics.offersReceived, 3);
+  assert.equal(populatedAgencyReport.body.metrics.awardRatePercent, 50);
+  assert.equal(populatedAgencyReport.body.metrics.responseTimeMinutes, 15);
+  assert.deepEqual(populatedAgencyReport.body.metrics.savingsByCurrency, [{ currency: config.defaultCurrency, totalMinor: '10000', requestCount: 1 }]);
+  assert.equal((await api(baseUrl, seller, '/v1/reports/agency')).status, 403);
+
+  const admin = await registerAgency(baseUrl, pool, 'reports-admin@platform.example');
+  await pool.query('UPDATE users SET is_platform_admin = TRUE WHERE id = $1', [admin.userId]);
+  const enrollment = createTotpEnrollment('reports-admin@platform.example', mfaKey);
+  await pool.query('INSERT INTO user_mfa (user_id, secret_ciphertext, enabled) VALUES ($1, $2, TRUE)', [admin.userId, enrollment.secretCiphertext]);
+  const dashboard = await api(baseUrl, admin, '/v1/admin/analytics/marketplace');
+  assert.equal(dashboard.status, 200);
+  assert.equal(dashboard.body.metrics.publishedRequests, 2);
+  assert.equal(dashboard.body.metrics.offersReceived, 3);
+  assert.equal(dashboard.body.metrics.averageOffersPerRequest, 1.5);
+  assert.equal(dashboard.body.metrics.awardRatePercent, 50);
+  assert.equal(dashboard.body.metrics.responseTimeMinutes, 15);
+  assert.equal(dashboard.body.metrics.awardedRequests, 1);
+  assert.equal(dashboard.body.metrics.bookedAwards, 1);
+  assert.equal(dashboard.body.metrics.bookingConversionPercent, 50);
+});
+
+test('platform admins can search and paginate unified audit events while other users are denied', async (context) => {
+  const { pool, baseUrl } = await startApp(context);
+  const admin = await registerAgency(baseUrl, pool, 'audit-admin@platform.example');
+  const agency = await registerAgency(baseUrl, pool, 'audit-agency@agency.example');
+  await pool.query('UPDATE users SET is_platform_admin = TRUE WHERE id = $1', [admin.userId]);
+  const enrollment = createTotpEnrollment('audit-admin@platform.example', mfaKey);
+  await pool.query('INSERT INTO user_mfa (user_id, secret_ciphertext, enabled) VALUES ($1, $2, TRUE)', [admin.userId, enrollment.secretCiphertext]);
+  const organizationId = agency.organizationId;
+  await pool.query(
+    `INSERT INTO organization_audit_events (id, organization_id, actor_user_id, action, details)
+     VALUES ($1, $2, $3, 'organization.profile.updated', $4)`,
+    [randomUUID(), organizationId, agency.userId, JSON.stringify({ note: 'audit-search-needle' })],
+  );
+  await pool.query(
+    `INSERT INTO seller_profile_changes (id, seller_organization_id, changed_by_user_id, previous_profile, updated_profile)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [randomUUID(), organizationId, agency.userId, JSON.stringify({ city: 'Old' }), JSON.stringify({ city: 'New', marker: 'profile-change' })],
+  );
+  await pool.query(
+    `INSERT INTO platform_setting_changes (id, setting_key, old_value, new_value, changed_by)
+     VALUES ($1, 'max_offers_per_request', '10'::jsonb, '12'::jsonb, $2)`,
+    [randomUUID(), admin.userId],
+  );
+
+  const denied = await api(baseUrl, agency, '/v1/admin/audit-events');
+  assert.equal(denied.status, 403);
+  const all = await api(baseUrl, admin, '/v1/admin/audit-events?limit=2');
+  assert.equal(all.status, 200);
+  assert.equal(all.body.pagination.total, 3);
+  assert.equal(all.body.events.length, 2);
+  assert.equal(all.body.pagination.hasMore, true);
+  assert.ok(all.body.events.every((event) => event.organizationId || event.source === 'platform_setting'));
+
+  const searched = await api(baseUrl, admin, '/v1/admin/audit-events?q=audit-search-needle');
+  assert.equal(searched.body.pagination.total, 1);
+  assert.equal(searched.body.events[0].action, 'organization.profile.updated');
+  const sourceFiltered = await api(baseUrl, admin, `/v1/admin/audit-events?source=seller_profile&organizationId=${organizationId}`);
+  assert.equal(sourceFiltered.body.pagination.total, 1);
+  assert.equal(sourceFiltered.body.events[0].action, 'seller_profile.updated');
+  const dateFiltered = await api(baseUrl, admin, `/v1/admin/audit-events?from=${new Date().toISOString().slice(0, 10)}&to=invalid`);
+  assert.equal(dateFiltered.status, 400);
 });
 
 test('webhooks to private network addresses are refused at connect time', async (context) => {

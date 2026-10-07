@@ -7,6 +7,30 @@ const nonCountryKinds = destinationKinds.filter((kind) => kind.value !== 'countr
 
 // Admin-changeable settings; the config value is the default until an admin overrides it.
 export const platformSettingDefinitions = {
+  monetization_subscriptions_enabled: {
+    label: 'Subscription plans',
+    description: 'Feature gate only. Subscription plans and billing must be implemented separately before charging users.',
+    type: 'boolean',
+    defaultValue: () => false,
+  },
+  monetization_credits_enabled: {
+    label: 'Seller credits',
+    description: 'Feature gate only. Credit balances, purchase and usage workflows must be implemented separately.',
+    type: 'boolean',
+    defaultValue: () => false,
+  },
+  monetization_commission_enabled: {
+    label: 'Award commission',
+    description: 'Feature gate only. Commission calculation, invoicing and collection must be implemented separately.',
+    type: 'boolean',
+    defaultValue: () => false,
+  },
+  monetization_featured_listings_enabled: {
+    label: 'Paid featured seller listings',
+    description: 'Feature gate only. Paid ranking, listing purchase and placement workflows must be implemented separately.',
+    type: 'boolean',
+    defaultValue: () => false,
+  },
   max_offers_per_request: {
     label: 'Active offers per request',
     description: 'Maximum active offers a request accepts. Withdrawn offers free a slot.',
@@ -144,6 +168,14 @@ export const platformSettingDefinitions = {
     max: 5000,
     defaultValue: () => config.routing.maxHotelPropertiesPerOrganization,
   },
+  hotel_room_hold_minutes: {
+    label: 'Hotel room hold duration',
+    description: 'Minutes an awarded hotel room allocation is held while the agency confirms the booking.',
+    unit: 'minutes',
+    min: 1,
+    max: 1440,
+    defaultValue: () => config.hotels.roomHoldMinutes,
+  },
 };
 
 const listItemSchemas = {
@@ -154,6 +186,7 @@ const listItemSchemas = {
 
 export function settingSchema(key) {
   const definition = platformSettingDefinitions[key];
+  if (definition.type === 'boolean') return z.boolean();
   if (definition.type === 'list') {
     const item = definition.item === 'kind' ? z.enum(definition.options) : listItemSchemas[definition.item];
     return z.array(item).max(definition.maxItems).transform((values) => [...new Set(values)]);
@@ -163,6 +196,7 @@ export function settingSchema(key) {
 
 export function settingErrorMessage(key) {
   const definition = platformSettingDefinitions[key];
+  if (definition.type === 'boolean') return `${definition.label} must be on or off.`;
   if (definition.type === 'list') return `${definition.label} must be a list of up to ${definition.maxItems} valid values${definition.options ? ` (${definition.options.join(', ')})` : ''}.`;
   return `${definition.label} must be a whole number from ${definition.min} to ${definition.max}.`;
 }

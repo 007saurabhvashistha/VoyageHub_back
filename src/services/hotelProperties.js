@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { hotelCategories } from '../config/referenceData.js';
+import { config } from '../config/index.js';
+import { hotelCategories, hotelFacilities, mealPlans } from '../config/referenceData.js';
 import { destinationDto, findDestination, resolveActiveDestinations } from './destinations.js';
 import { getSetting } from './platformSettings.js';
 import { notify, pruneSellerTargets, retargetSeller } from './routing.js';
@@ -14,20 +15,32 @@ export const propertyInputSchema = z.object({
   destination_id: z.uuid('Choose where the hotel is located from the destination list.'),
   star_category: z.coerce.number().int().refine((value) => starValues.includes(value), 'Choose a supported star category.').nullish().transform((value) => value ?? null),
   room_count: z.coerce.number().int().min(1, 'Rooms must be between 1 and 5000.').max(5000, 'Rooms must be between 1 and 5000.').nullish().transform((value) => value ?? null),
+  room_types: z.array(z.string().trim().min(2).max(120)).max(config.hotels.maxRoomTypes).default([]).transform((items) => [...new Set(items)]),
+  meal_plans: z.array(z.enum(mealPlans.map((item) => item.value))).max(mealPlans.length).default([]).transform((items) => [...new Set(items)]),
+  facilities: z.array(z.enum(hotelFacilities.map((item) => item.value))).max(hotelFacilities.length).default([]).transform((items) => [...new Set(items)]),
 });
 
 export const propertyUpdateSchema = propertyInputSchema.partial().extend({
   active: z.boolean().optional(),
 }).refine((value) => Object.keys(value).length > 0, 'Change at least one field.');
 
-export async function propertyDto(db, row) {
+export async function propertyDto(db, row, { photos = null } = {}) {
   const destination = await findDestination(db, row.destination_id);
+  const photoRows = photos ?? (await db.query(
+    'SELECT id, original_filename, content_type, size_bytes, scan_status, created_at FROM hotel_property_photos WHERE property_id = $1 AND deleted_at IS NULL ORDER BY created_at, id',
+    [row.id],
+  )).rows;
   return {
     id: row.id,
     name: row.name,
     destination: destination ? destinationDto(destination) : null,
     starCategory: row.star_category,
     roomCount: row.room_count,
+    roomTypes: row.room_types ?? [],
+    mealPlans: row.meal_plans ?? [],
+    facilities: row.facilities ?? [],
+    ownershipCheckStatus: row.ownership_check_status ?? 'pending',
+    photos: photoRows.map((photo) => ({ id: photo.id, filename: photo.original_filename, contentType: photo.content_type, sizeBytes: photo.size_bytes, scanStatus: photo.scan_status, createdAt: photo.created_at })),
     active: row.active,
     verificationStatus: row.verification_status,
     verificationReason: row.verification_reason,
@@ -38,8 +51,14 @@ export async function propertyDto(db, row) {
 
 export async function listProperties(db, organizationId) {
   const result = await db.query('SELECT * FROM hotel_properties WHERE organization_id = $1 ORDER BY created_at, id', [organizationId]);
+  const photos = result.rowCount ? await db.query(
+    'SELECT id, property_id, original_filename, content_type, size_bytes, scan_status, created_at FROM hotel_property_photos WHERE property_id = ANY($1::uuid[]) AND deleted_at IS NULL ORDER BY created_at, id',
+    [result.rows.map((row) => row.id)],
+  ) : { rows: [] };
+  const photosByProperty = new Map();
+  for (const photo of photos.rows) photosByProperty.set(photo.property_id, [...(photosByProperty.get(photo.property_id) ?? []), photo]);
   const properties = [];
-  for (const row of result.rows) properties.push(await propertyDto(db, row));
+  for (const row of result.rows) properties.push(await propertyDto(db, row, { photos: photosByProperty.get(row.id) ?? [] }));
   return properties;
 }
 
@@ -71,9 +90,9 @@ export async function createProperty(client, { organizationId, input }) {
   const location = await validatePropertyDestination(client, input.destination_id);
   if (location.error) return { status: 400, code: 'VALIDATION_ERROR', error: location.error };
   const result = await client.query(
-    `INSERT INTO hotel_properties (id, organization_id, name, destination_id, star_category, room_count)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-    [randomUUID(), organizationId, input.name, input.destination_id, input.star_category, input.room_count],
+    `INSERT INTO hotel_properties (id, organization_id, name, destination_id, star_category, room_count, room_types, meal_plans, facilities)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+    [randomUUID(), organizationId, input.name, input.destination_id, input.star_category, input.room_count, input.room_types, input.meal_plans, input.facilities],
   );
   await syncPrimaryProperty(client, organizationId);
   return { property: result.rows[0] };
@@ -99,14 +118,21 @@ export async function updateProperty(client, { organizationId, propertyId, input
        name = COALESCE($3, name), destination_id = COALESCE($4, destination_id),
        star_category = CASE WHEN $5::boolean THEN $6 ELSE star_category END,
        room_count = CASE WHEN $7::boolean THEN $8 ELSE room_count END,
-       active = COALESCE($9, active),
-       verification_status = CASE WHEN $10::boolean THEN 'pending' ELSE verification_status END,
-       verification_reason = CASE WHEN $10::boolean THEN 'Hotel location changed and requires a new review.' ELSE verification_reason END,
+      room_types = CASE WHEN $9::boolean THEN $10 ELSE room_types END,
+      meal_plans = CASE WHEN $11::boolean THEN $12 ELSE meal_plans END,
+      facilities = CASE WHEN $13::boolean THEN $14 ELSE facilities END,
+      active = COALESCE($15, active),
+      verification_status = CASE WHEN $16::boolean THEN 'pending' ELSE verification_status END,
+      ownership_check_status = CASE WHEN $16::boolean THEN 'pending' ELSE ownership_check_status END,
+      verification_reason = CASE WHEN $16::boolean THEN 'Hotel location changed and requires a new review.' ELSE verification_reason END,
        updated_at = NOW()
      WHERE id = $1 AND organization_id = $2 RETURNING *`,
     [propertyId, organizationId, input.name ?? null, moved ? input.destination_id : null,
       Object.hasOwn(input, 'star_category'), input.star_category ?? null,
       Object.hasOwn(input, 'room_count'), input.room_count ?? null,
+      Object.hasOwn(input, 'room_types'), input.room_types ?? null,
+      Object.hasOwn(input, 'meal_plans'), input.meal_plans ?? null,
+      Object.hasOwn(input, 'facilities'), input.facilities ?? null,
       input.active ?? null, moved],
   );
   await syncPrimaryProperty(client, organizationId);
@@ -118,7 +144,9 @@ export async function updateProperty(client, { organizationId, propertyId, input
 
 export async function decideProperty(client, { propertyId, decision, reason, reviewerId }) {
   const result = await client.query(
-    `UPDATE hotel_properties SET verification_status = $2, verification_reason = $3, reviewed_by = $4, reviewed_at = NOW(), updated_at = NOW()
+     `UPDATE hotel_properties SET verification_status = $2::varchar, verification_reason = $3,
+       ownership_check_status = CASE WHEN $2::varchar = 'approved' THEN 'verified' ELSE 'rejected' END,
+       reviewed_by = $4, reviewed_at = NOW(), updated_at = NOW()
      WHERE id = $1 AND verification_status = 'pending' RETURNING *`,
     [propertyId, decision, reason, reviewerId],
   );

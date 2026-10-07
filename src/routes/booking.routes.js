@@ -6,6 +6,7 @@ import { config } from '../config/index.js';
 import { capabilities } from '../config/referenceData.js';
 import { guestAccessWindow, openGuestDetails, parseGuestDetails, sealGuestDetails } from '../services/bookingGuestDetails.js';
 import { bookingChangeResponseSchema, bookingChangeSchema, bookingChangeDto, loadBookingChanges } from '../services/bookingChanges.js';
+import { bookHotelRoomHold, confirmHotelRoomHold, createHotelRoomHold, releaseHotelRoomHold } from '../services/hotelRoomHolds.js';
 import { recordOrganizationEvent } from '../services/organizationAudit.js';
 import { organizationIsActive } from '../services/organizationLifecycle.js';
 import { requireCapability } from '../services/permissions.js';
@@ -46,7 +47,7 @@ const bookingSelect = `
          r.adults, r.children, r.infants,
          COALESCE((SELECT (c.proposed_changes->>'room_count')::int FROM booking_change_requests c WHERE c.award_id = a.id AND c.status = 'accepted' AND c.change_type = 'amendment' AND c.proposed_changes ? 'room_count' ORDER BY c.responded_at DESC LIMIT 1), f.room_count, r.room_count) AS effective_room_count,
          r.room_count AS request_room_count,
-         f.offer_kind, COALESCE(opt.room_type, f.room_type) AS room_type, f.room_count AS offer_room_count,
+         f.offer_kind, f.hotel_property_id, COALESCE(opt.room_type, f.room_type) AS room_type, f.room_count AS offer_room_count,
          COALESCE(opt.meal_plan, f.meal_plan) AS meal_plan, f.currency,
          COALESCE(opt.total_minor, f.total_minor) AS total_minor, COALESCE(opt.rate_per_night_minor, f.rate_per_night_minor) AS rate_per_night_minor,
          a.offer_option_id, COALESCE(opt.label, f.option_label) AS option_label, COALESCE(opt.hotel_category, f.hotel_category) AS hotel_category,
@@ -54,6 +55,7 @@ const bookingSelect = `
          (${organizationIsActive('seller')}) AS seller_active,
          g.award_id IS NOT NULL AS has_guest_details, g.guest_count, g.trip_end_date::text AS trip_end_date,
          g.version AS guest_version, g.released_at, g.revoked_at, g.revoked_reason, g.purged_at, g.updated_at AS guest_updated_at,
+         hotel_hold.status AS room_hold_status, hotel_hold.expires_at AS room_hold_expires_at,
          (SELECT COUNT(*)::int FROM booking_vouchers v WHERE v.award_id = a.id AND v.deleted_at IS NULL) AS voucher_count
   FROM awards a
   JOIN marketplace_requests r ON r.id = a.request_id
@@ -61,7 +63,8 @@ const bookingSelect = `
   LEFT JOIN offer_options opt ON opt.id = a.offer_option_id
   JOIN organizations agency ON agency.id = a.agency_organization_id
   JOIN organizations seller ON seller.id = a.seller_organization_id
-  LEFT JOIN booking_guest_details g ON g.award_id = a.id`;
+  LEFT JOIN booking_guest_details g ON g.award_id = a.id
+  LEFT JOIN hotel_room_holds hotel_hold ON hotel_hold.award_id = a.id`;
 
 function fail(response, status, code, message) {
   return response.status(status).json({ error: { code, message } });
@@ -170,6 +173,7 @@ function bookingDto(row, organizationId, settings) {
       ratePerNightMinor: row.rate_per_night_minor == null ? null : Number(row.rate_per_night_minor),
     },
     status: row.status,
+    roomHold: row.room_hold_status ? { status: row.room_hold_status, expiresAt: row.room_hold_expires_at } : null,
     awardedAt: row.created_at,
     bookingConfirmedAt: row.booking_confirmed_at,
     sellerConfirmationNumber: row.seller_confirmation_number,
@@ -364,6 +368,7 @@ export function createBookingRouter({ pool, storage = null, guestDataEncryptionK
         const cancellation = change.change_type === 'cancellation';
         if (accept && cancellation) {
           await client.query("UPDATE awards SET status = 'cancelled' WHERE id = $1", [awardId]);
+          await releaseHotelRoomHold(client, awardId);
           const revoked = await client.query(
             `UPDATE booking_guest_details SET revoked_at = COALESCE(revoked_at, NOW()),
                revoked_reason = 'Booking cancellation accepted', updated_at = NOW()
@@ -399,8 +404,26 @@ export function createBookingRouter({ pool, storage = null, guestDataEncryptionK
         if (!booking || booking.agency_organization_id !== me) return { error: [404, 'BOOKING_NOT_FOUND', 'Booking was not found.'] };
         if (booking.status !== 'awarded') return { error: [409, 'BOOKING_ALREADY_CONFIRMED', 'This booking has already been confirmed or cancelled.'] };
         if (!booking.seller_active) return { error: [409, 'SELLER_UNAVAILABLE', 'The awarded seller is suspended or closing, so guest details cannot be released.'] };
+        let roomHold = await client.query('SELECT status, expires_at FROM hotel_room_holds WHERE award_id = $1 FOR UPDATE', [awardId]);
+        if (roomHold.rowCount && (roomHold.rows[0].status !== 'held' || new Date(roomHold.rows[0].expires_at) <= new Date())) {
+          const renewed = await createHotelRoomHold(client, {
+            awardId,
+            organizationId: booking.seller_organization_id,
+            propertyId: booking.hotel_property_id,
+            requestId: booking.request_id,
+            offerId: booking.offer_id,
+            roomType: booking.room_type,
+            rooms: bookingFacts(booking).roomCount,
+            startDate: booking.travel_start_date,
+            endDate: booking.travel_end_date,
+          });
+          if (renewed.error) return { error: renewed.error };
+          if (!renewed.hold) return { error: [409, 'ROOM_HOLD_EXPIRED', 'The hotel no longer has date-specific inventory configured. Ask the seller to reconfirm availability.'] };
+          roomHold = { rowCount: 1, rows: [{ status: renewed.hold.status, expires_at: renewed.hold.expires_at }] };
+        }
         const parsed = parseGuestDetails(request.body, bookingFacts(booking));
         if (parsed.error) return { error: [400, 'VALIDATION_ERROR', parsed.error] };
+        if (roomHold.rowCount) await confirmHotelRoomHold(client, awardId);
         await client.query(
           `INSERT INTO booking_guest_details (award_id, ciphertext, guest_count, trip_end_date, updated_by)
            VALUES ($1, $2, $3, $4, $5)`,
@@ -565,6 +588,7 @@ export function createBookingRouter({ pool, storage = null, guestDataEncryptionK
              seller_confirmed_at = NOW(), seller_confirmed_by = $4 WHERE id = $1`,
           [awardId, input.data.confirmation_number, input.data.note, request.auth.user_id],
         );
+        await bookHotelRoomHold(client, awardId);
         const updated = booking.status === 'booked';
         await notify(client, booking.agency_organization_id, 'booking_seller_confirmed', updated ? 'Booking reference updated' : 'Seller confirmed the booking', `${booking.request_code} / ${booking.seller_name} / Reference ${input.data.confirmation_number}`, { awardId, requestId: booking.request_id, requestCode: booking.request_code });
         await recordOrganizationEvent(client, { organizationId: me, actorUserId: request.auth.user_id, action: updated ? 'booking.reference_updated' : 'booking.seller_confirmed', details: { awardId, requestCode: booking.request_code } });

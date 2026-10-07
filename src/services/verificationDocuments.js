@@ -8,6 +8,11 @@ import { verificationDocumentRequirements, verificationDocumentTypes } from '../
 
 const documentLabels = new Map(verificationDocumentTypes.map((type) => [type.value, type.label]));
 
+function dateOnly(value) {
+  if (value == null) return null;
+  return value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10);
+}
+
 export const verificationDecisionSchema = z.object({
   decision: z.enum(['approved', 'rejected'], { error: 'Decision must be approved or rejected.' }),
   reason: z.string({ error: 'Provide a review reason between 5 and 500 characters.' }).trim()
@@ -51,6 +56,7 @@ export function documentRequirementsFor(businessType, countryCode) {
 }
 
 export function documentDto(row) {
+  const expiresAt = dateOnly(row.expires_at);
   return {
     id: row.id,
     type: row.document_type,
@@ -62,6 +68,8 @@ export function documentDto(row) {
     scanResult: row.scan_result,
     scannedAt: row.scanned_at,
     uploadedAt: row.created_at,
+    expiresAt,
+    expired: Boolean(expiresAt && expiresAt < new Date().toISOString().slice(0, 10)),
     supersededAt: row.superseded_at,
     removedAt: row.deleted_at,
   };
@@ -82,11 +90,11 @@ export async function verificationDocumentStatus(db, { organizationId, businessT
   const byType = new Map((await currentDocuments(db, organizationId)).map((row) => [row.document_type, documentDto(row)]));
   const requirements = documentRequirementsFor(businessType, countryCode).map((item) => ({ ...item, document: byType.get(item.type) ?? null }));
   const missing = requirements
-    .filter((item) => item.required && !(item.document?.scanStatus === 'clean' && !item.document.removedAt))
+    .filter((item) => item.required && !(item.document?.scanStatus === 'clean' && !item.document.removedAt && !item.document.expired))
     .map((item) => item.type);
   // Submitting for review only needs a usable upload; approval still waits for a clean scan.
   const notUploaded = requirements
-    .filter((item) => item.required && !(['pending', 'clean'].includes(item.document?.scanStatus) && !item.document.removedAt))
+    .filter((item) => item.required && !(['pending', 'clean'].includes(item.document?.scanStatus) && !item.document.removedAt && !item.document.expired))
     .map((item) => item.type);
   return { requirements, complete: missing.length === 0, missing, notUploaded };
 }

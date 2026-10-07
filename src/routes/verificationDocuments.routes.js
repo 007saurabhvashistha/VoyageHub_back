@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Router } from 'express';
 import multer from 'multer';
+import { z } from 'zod';
 import { config } from '../config/index.js';
 import { capabilities } from '../config/referenceData.js';
 import { requireCapability } from '../services/permissions.js';
@@ -89,6 +90,11 @@ export function createVerificationDocumentsRouter({ pool, storage }) {
     return fail(response, status, code, message);
   }), async (request, response, next) => {
     const documentType = typeof request.body?.document_type === 'string' ? request.body.document_type : '';
+    const rawExpiry = typeof request.body?.expires_at === 'string' ? request.body.expires_at.trim() : '';
+    const expiry = rawExpiry ? z.iso.date().safeParse(rawExpiry) : null;
+    if (rawExpiry && !expiry.success) return fail(response, 400, 'VALIDATION_ERROR', 'Use a valid document expiry date.');
+    const expiresAt = expiry?.success ? expiry.data : null;
+    if (expiresAt && expiresAt < new Date().toISOString().slice(0, 10)) return fail(response, 400, 'VALIDATION_ERROR', 'A replacement document must not already be expired.');
     const allowedTypes = new Set(documentRequirementsFor(request.auth.business_type, request.auth.country_code).map((item) => item.type));
     if (!allowedTypes.has(documentType)) return fail(response, 400, 'VALIDATION_ERROR', 'Choose a document type listed for your business.');
     if (!request.file?.buffer?.length) return fail(response, 400, 'VALIDATION_ERROR', 'Attach the document file.');
@@ -143,9 +149,9 @@ export function createVerificationDocumentsRouter({ pool, storage }) {
         [organizationId, documentType],
       );
       const inserted = await client.query(
-        `INSERT INTO organization_documents (id, organization_id, document_type, storage_provider, storage_key, original_filename, content_type, size_bytes, sha256, uploaded_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-        [documentId, organizationId, documentType, storage.provider, storageKey, filename, detected.mime, request.file.size, sha256Hex(request.file.buffer), request.auth.user_id],
+        `INSERT INTO organization_documents (id, organization_id, document_type, storage_provider, storage_key, original_filename, content_type, size_bytes, sha256, uploaded_by, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+        [documentId, organizationId, documentType, storage.provider, storageKey, filename, detected.mime, request.file.size, sha256Hex(request.file.buffer), request.auth.user_id, expiresAt],
       );
       await recordOrganizationEvent(client, { organizationId, actorUserId: request.auth.user_id, action: 'document.uploaded', details: { documentId, documentType } });
       await client.query('COMMIT');

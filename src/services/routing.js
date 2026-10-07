@@ -26,8 +26,10 @@ export async function loadRequestStops(db, requestId) {
 
 export async function loadRoutingRequest(db, requestId) {
   const result = await db.query(
-    `SELECT id, request_code, agency_organization_id, requirement_type, hotel_category, visibility, nights,
-            destination, status, response_deadline
+      `SELECT id, request_code, agency_organization_id, requirement_type, hotel_category, visibility, nights,
+            destination, status, response_deadline, group_type, adults, children, infants,
+          budget_min_minor, budget_max_minor, budget_currency, travel_start_date, travel_end_date, room_count,
+          seller_visible_snapshot
      FROM marketplace_requests WHERE id = $1`,
     [requestId],
   );
@@ -38,12 +40,12 @@ export async function loadRoutingRequest(db, requestId) {
 export const routeLabel = (stops) => stops.map((stop) => stop.nights ? `${stop.name} ${stop.nights}N` : stop.name).join(' → ');
 
 const eligibleSeller = (audienceParam) => `seller.business_type = ${audienceParam}
-  AND profile.verification_status = 'approved' AND ${organizationIsActive('seller')}
+  AND profile.verification_status = 'approved' AND profile.accepting_requests AND ${organizationIsActive('seller')}
   AND ($2::uuid IS NULL OR seller.id <> $2)
   AND ($3::uuid[] IS NULL OR seller.id = ANY($3::uuid[]))`;
 
 // Hotels match when an approved, active property sits at the requested destination or anywhere inside it.
-async function hotelAudience(db, { destinationIds, hotelCategory, excludeOrganizationId, sellerIds, audience }) {
+async function hotelAudience(db, { destinationIds, hotelCategory, excludeOrganizationId, sellerIds, audience, travelStartDate, travelEndDate, roomCount }) {
   const result = await db.query(
     `SELECT hp.organization_id AS seller_organization_id, 'full' AS match_type,
             array_agg(hp.id ORDER BY hp.name, hp.id) AS matching_property_ids
@@ -55,15 +57,19 @@ async function hotelAudience(db, { destinationIds, hotelCategory, excludeOrganiz
        AND ${eligibleSeller('$5')}
        AND located.match_path @> $1::uuid[]
        AND ($4::smallint IS NULL OR hp.star_category IS NULL OR hp.star_category = $4)
+       AND ($6::date IS NULL OR NOT EXISTS (SELECT 1 FROM hotel_room_inventory configured WHERE configured.organization_id = seller.id)
+         OR (SELECT COUNT(DISTINCT inventory.inventory_date) FROM hotel_room_inventory inventory
+             WHERE inventory.organization_id = seller.id AND inventory.inventory_date >= $6::date AND inventory.inventory_date < $7::date
+               AND inventory.available_rooms >= COALESCE($8::smallint, 1)) = ($7::date - $6::date))
      GROUP BY hp.organization_id`,
-    [destinationIds.slice(0, 1), excludeOrganizationId, sellerIds, hotelCategory, audience],
+    [destinationIds.slice(0, 1), excludeOrganizationId, sellerIds, hotelCategory, audience, travelStartDate, travelEndDate, roomCount],
   );
   return result.rows;
 }
 
 // DMCs match when coverage overlaps any stop in either direction; "full" needs every stop covered from above.
 // The most specific rule (deepest destination) applying to a stop decides include vs exclude.
-async function dmcAudience(db, { destinationIds, excludeOrganizationId, sellerIds, audience }) {
+async function dmcAudience(db, { destinationIds, excludeOrganizationId, sellerIds, audience, groupType, groupSize, budgetMinMinor, budgetMaxMinor, budgetCurrency }) {
   const result = await db.query(
     `WITH stops AS (
        SELECT d.id AS destination_id, d.match_path FROM destinations d WHERE d.id = ANY($1::uuid[])
@@ -71,6 +77,10 @@ async function dmcAudience(db, { destinationIds, excludeOrganizationId, sellerId
        SELECT seller.id FROM organizations seller
        JOIN seller_profiles profile ON profile.organization_id = seller.id
        WHERE ${eligibleSeller('$4')}
+         AND (cardinality(profile.handled_group_types) = 0 OR $5::text IS NULL OR $5 = ANY(profile.handled_group_types))
+         AND (profile.minimum_group_size IS NULL OR $6::integer >= profile.minimum_group_size)
+         AND ($7::bigint IS NULL OR profile.budget_min_minor IS NULL OR profile.budget_currency IS DISTINCT FROM $9
+           OR (profile.budget_min_minor <= $8 AND profile.budget_max_minor >= $7))
          AND EXISTS (
            SELECT 1 FROM seller_coverage c JOIN destinations cd ON cd.id = c.destination_id CROSS JOIN stops s
            WHERE c.organization_id = seller.id AND c.mode = 'include'
@@ -93,16 +103,19 @@ async function dmcAudience(db, { destinationIds, excludeOrganizationId, sellerId
        ARRAY[]::uuid[] AS matching_property_ids
      FROM stop_status GROUP BY seller_id
      HAVING bool_or(COALESCE(ancestor_mode = 'include', FALSE) OR includes_inside)`,
-    [destinationIds, excludeOrganizationId, sellerIds, audience],
+    [destinationIds, excludeOrganizationId, sellerIds, audience, groupType, groupSize, budgetMinMinor, budgetMaxMinor, budgetCurrency],
   );
   return result.rows;
 }
 
 // Sellers that may see a lead with these facts. Rule 0: only the requirement type's audience is ever considered.
-export async function findAudience(db, { requirementType, destinationIds, hotelCategory = null, excludeOrganizationId = null, sellerIds = null }) {
+export async function findAudience(db, { requirementType, destinationIds, hotelCategory = null, excludeOrganizationId = null, sellerIds = null,
+  groupType = null, groupSize = null, budgetMinMinor = null, budgetMaxMinor = null, budgetCurrency = null,
+  travelStartDate = null, travelEndDate = null, roomCount = null }) {
   const audience = audienceFor(requirementType);
   if (!audience || !destinationIds.length) return [];
-  const input = { destinationIds, hotelCategory, excludeOrganizationId, sellerIds: sellerIds?.length ? sellerIds : null, audience };
+  const input = { destinationIds, hotelCategory, excludeOrganizationId, sellerIds: sellerIds?.length ? sellerIds : null, audience,
+    groupType, groupSize, budgetMinMinor, budgetMaxMinor, budgetCurrency, travelStartDate, travelEndDate, roomCount };
   const rows = audience === 'hotelier' ? await hotelAudience(db, input) : await dmcAudience(db, input);
   return rows.map((row) => ({ ...row, business_type: audience }));
 }
@@ -115,7 +128,7 @@ async function invitedAudience(db, request) {
      JOIN organizations seller ON seller.id = invitation.seller_organization_id
      JOIN seller_profiles profile ON profile.organization_id = seller.id
      WHERE invitation.request_id = $1 AND seller.business_type = $2
-       AND profile.verification_status = 'approved' AND ${organizationIsActive('seller')}`,
+       AND profile.verification_status = 'approved' AND profile.accepting_requests AND ${organizationIsActive('seller')}`,
     [request.id, audience],
   );
   return result.rows.map((row) => row.seller_organization_id);
@@ -125,7 +138,15 @@ export async function computeTargets(db, request, { sellerIds = null } = {}) {
   const destinationIds = request.stops.map((stop) => stop.destination_id);
   const byId = new Map();
   if (['open', 'open_and_invite'].includes(request.visibility)) {
-    const matched = await findAudience(db, { requirementType: request.requirement_type, destinationIds, hotelCategory: request.hotel_category, excludeOrganizationId: request.agency_organization_id, sellerIds });
+    const matched = await findAudience(db, {
+      requirementType: request.requirement_type, destinationIds, hotelCategory: request.hotel_category,
+      excludeOrganizationId: request.agency_organization_id, sellerIds,
+      groupType: request.group_type, groupSize: Number(request.adults ?? 0) + Number(request.children ?? 0) + Number(request.infants ?? 0),
+      budgetMinMinor: request.budget_min_minor == null ? null : Number(request.budget_min_minor),
+      budgetMaxMinor: request.budget_max_minor == null ? null : Number(request.budget_max_minor),
+      budgetCurrency: request.budget_currency, travelStartDate: request.travel_start_date,
+      travelEndDate: request.travel_end_date, roomCount: request.room_count,
+    });
     for (const row of matched) byId.set(row.seller_organization_id, row);
   }
   if (['invite_only', 'open_and_invite'].includes(request.visibility)) {
@@ -150,7 +171,38 @@ async function loadAlertPreferences(db, sellerIds) {
 
 const matchOrder = { invited: 0, full: 1, partial: 2 };
 
-// Sends request_matched per seller preference: instant, daily digest, or nothing. Invitations always alert instantly.
+async function enqueueMatchWebhook(db, organizationId, request, target, { title, message }) {
+  const messageId = `msg_${randomUUID().replaceAll('-', '')}`;
+  const data = {
+    requestId: request.id,
+    requestCode: request.request_code,
+    destination: request.destination,
+    requirementType: request.requirement_type,
+    matchType: target.match_type,
+    matchingPropertyIds: target.matching_property_ids,
+    leadSnapshot: request.seller_visible_snapshot,
+  };
+  const endpoints = await db.query(
+    `SELECT id FROM webhook_endpoints
+     WHERE organization_id = $1 AND status = 'active' AND 'request_matched' = ANY(event_types)`,
+    [organizationId],
+  );
+  const payload = JSON.stringify({
+    type: 'request_matched',
+    timestamp: new Date().toISOString(),
+    data: { ...data, organizationId, title, message },
+  });
+  for (const endpoint of endpoints.rows) {
+    await db.query(
+      `INSERT INTO webhook_deliveries (endpoint_id, organization_id, event_type, message_id, payload)
+       VALUES ($1, $2, 'request_matched', $3, $4::jsonb)
+       ON CONFLICT (endpoint_id, message_id) DO NOTHING`,
+      [endpoint.id, organizationId, messageId, payload],
+    );
+  }
+}
+
+// In-app alerts follow seller preferences (invitations stay instant); subscribed CRM webhooks receive every match.
 export async function deliverMatchAlerts(db, request, targets) {
   const pending = targets.filter((target) => !target.alerted_at);
   if (!pending.length) return { instant: 0, digest: 0, skipped: 0 };
@@ -175,14 +227,20 @@ export async function deliverMatchAlerts(db, request, targets) {
     if (delivery === 'instant') {
       await notify(db, target.seller_organization_id, 'request_matched', invited ? 'You were invited to a request' : 'New matching request',
         `${request.request_code} / ${label} / ${request.nights} nights`,
-        { requestId: request.id, requestCode: request.request_code, destination: request.destination, requirementType: request.requirement_type, matchType: target.match_type, matchingPropertyIds: target.matching_property_ids });
+        { requestId: request.id, requestCode: request.request_code, destination: request.destination, requirementType: request.requirement_type, matchType: target.match_type, matchingPropertyIds: target.matching_property_ids, leadSnapshot: request.seller_visible_snapshot });
       if (!invited) instantCount += 1;
       counts.instant += 1;
-    } else if (delivery === 'digest') {
-      await db.query('INSERT INTO alert_digest_items (organization_id, request_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [target.seller_organization_id, request.id]);
-      counts.digest += 1;
     } else {
-      counts.skipped += 1;
+      await enqueueMatchWebhook(db, target.seller_organization_id, request, target, {
+        title: invited ? 'You were invited to a request' : 'New matching request',
+        message: `${request.request_code} / ${label} / ${request.nights} nights`,
+      });
+      if (delivery === 'digest') {
+        await db.query('INSERT INTO alert_digest_items (organization_id, request_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [target.seller_organization_id, request.id]);
+        counts.digest += 1;
+      } else {
+        counts.skipped += 1;
+      }
     }
     await db.query('UPDATE request_targets SET alerted_at = NOW() WHERE request_id = $1 AND seller_organization_id = $2', [request.id, target.seller_organization_id]);
   }

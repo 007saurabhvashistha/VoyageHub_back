@@ -5,9 +5,11 @@ import { startNotificationOutboxWorker } from './jobs/notificationOutbox.js';
 import { startRequestDeadlineWorker } from './jobs/requestDeadlines.js';
 import { startReminderWorker } from './jobs/reminders.js';
 import { startAccountRetentionWorker } from './jobs/accountRetention.js';
-import { startDocumentScanWorker } from './jobs/verificationDocuments.js';
+import { startDocumentExpiryWorker, startDocumentScanWorker } from './jobs/verificationDocuments.js';
 import { startWebhookDeliveryWorker } from './jobs/webhookDeliveries.js';
 import { startAlertDigestWorker } from './jobs/alertDigests.js';
+import { startDailyNotificationSummaryWorker } from './jobs/dailyNotificationSummaries.js';
+import { startHotelRoomHoldWorker } from './services/hotelRoomHolds.js';
 import { config } from './config/index.js';
 import { createResendEmailDelivery } from './services/resendEmailDelivery.js';
 import { createSmtpEmailDelivery } from './services/smtpEmailDelivery.js';
@@ -33,8 +35,11 @@ const stopDeadlineWorker = startRequestDeadlineWorker(pool);
 const stopReminderWorker = startReminderWorker(pool);
 const stopRetentionWorker = startAccountRetentionWorker(pool, { storage });
 const stopDocumentScanWorker = startDocumentScanWorker(pool, { storage, scanner: malwareScanner });
+const stopDocumentExpiryWorker = startDocumentExpiryWorker(pool);
 const stopWebhookWorker = startWebhookDeliveryWorker(pool, { encryptionKey: webhookEncryptionKey });
 const stopDigestWorker = startAlertDigestWorker(pool, { intervalMs: config.routing.digestIntervalMs });
+const stopDailySummaryWorker = startDailyNotificationSummaryWorker(pool, { intervalMs: config.routing.digestIntervalMs });
+const stopHotelRoomHoldWorker = startHotelRoomHoldWorker(pool);
 
 const server = app.listen(port, '0.0.0.0', () => {
   console.log(`VoyageHub API listening on port ${port}`);
@@ -52,8 +57,11 @@ async function shutdown() {
   stopReminderWorker();
   stopRetentionWorker();
   stopDocumentScanWorker();
+  stopDocumentExpiryWorker();
   stopWebhookWorker();
   stopDigestWorker();
+  stopDailySummaryWorker();
+  stopHotelRoomHoldWorker();
   server.close(async () => {
     await database.close();
     process.exit(0);
