@@ -40,6 +40,11 @@ export async function propertyDto(db, row, { photos = null } = {}) {
     mealPlans: row.meal_plans ?? [],
     facilities: row.facilities ?? [],
     ownershipCheckStatus: row.ownership_check_status ?? 'pending',
+    propertyProofDocumentId: row.property_proof_document_id ?? null,
+    ownershipProofType: row.ownership_proof_type ?? null,
+    ownershipReviewedBy: row.ownership_reviewed_by ?? null,
+    ownershipReviewedAt: row.ownership_reviewed_at ?? null,
+    ownershipRejectionReason: row.ownership_rejection_reason ?? null,
     photos: photoRows.map((photo) => ({ id: photo.id, filename: photo.original_filename, contentType: photo.content_type, sizeBytes: photo.size_bytes, scanStatus: photo.scan_status, createdAt: photo.created_at })),
     active: row.active,
     verificationStatus: row.verification_status,
@@ -157,3 +162,53 @@ export async function decideProperty(client, { propertyId, decision, reason, rev
   if (decision === 'approved' && property.active && await sellerApproved(client, property.organization_id)) await retargetSeller(client, property.organization_id);
   return property;
 }
+
+export async function linkPropertyProof(client, { organizationId, propertyId, documentId, proofType }) {
+  const current = await client.query('SELECT * FROM hotel_properties WHERE id = $1 AND organization_id = $2 FOR UPDATE', [propertyId, organizationId]);
+  if (!current.rowCount) return { status: 404, code: 'PROPERTY_NOT_FOUND', error: 'Hotel property was not found.' };
+
+  const docResult = await client.query(
+    'SELECT * FROM organization_documents WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL AND superseded_at IS NULL',
+    [documentId, organizationId],
+  );
+  if (!docResult.rowCount) return { status: 404, code: 'DOCUMENT_NOT_FOUND', error: 'Proof document was not found or is no longer active.' };
+
+  const document = docResult.rows[0];
+  if (document.document_type !== 'property_proof') return { status: 400, code: 'INVALID_DOCUMENT_TYPE', error: 'Selected document must be a proof of property ownership or management.' };
+  if (document.scan_status !== 'clean') return { status: 400, code: 'DOCUMENT_NOT_SCANNED', error: 'Document must be scanned clean before linking as property proof.' };
+
+  const updated = await client.query(
+    `UPDATE hotel_properties SET
+       property_proof_document_id = $3,
+       ownership_proof_type = $4,
+       ownership_check_status = 'evidence_ready',
+       ownership_rejection_reason = NULL,
+       updated_at = NOW()
+     WHERE id = $1 AND organization_id = $2 RETURNING *`,
+    [propertyId, organizationId, documentId, proofType],
+  );
+  return { property: updated.rows[0] };
+}
+
+export async function decidePropertyOwnership(client, { propertyId, decision, reason, reviewerId }) {
+  const current = await client.query('SELECT * FROM hotel_properties WHERE id = $1', [propertyId]);
+  if (!current.rowCount) return null;
+  const row = current.rows[0];
+
+  const updated = await client.query(
+    `UPDATE hotel_properties SET
+       ownership_check_status = $2::varchar,
+       ownership_reviewed_by = $3,
+       ownership_reviewed_at = NOW(),
+       ownership_rejection_reason = CASE WHEN $2::varchar = 'rejected' THEN $4 ELSE NULL END,
+       updated_at = NOW()
+     WHERE id = $1 RETURNING *`,
+    [propertyId, decision, reviewerId, reason],
+  );
+  if (!updated.rowCount) return null;
+  const property = updated.rows[0];
+  await notify(client, property.organization_id, 'hotel_ownership_reviewed', decision === 'verified' ? 'Hotel ownership verified' : 'Hotel ownership proof rejected',
+    `${property.name} / ${reason}`, { propertyId: property.id, decision });
+  return property;
+}
+

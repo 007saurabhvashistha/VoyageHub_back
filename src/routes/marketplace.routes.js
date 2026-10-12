@@ -1621,6 +1621,16 @@ export function createMarketplaceRouter({ pool, storage = null, comparisonRateFe
          ORDER BY f.created_at ASC`,
         [request.params.requestId, matchFilter],
       );
+      const sellerOrgIds = [...new Set(result.rows.map((row) => row.seller_organization_id))];
+      const reviewsResult = sellerOrgIds.length ? await pool.query(
+        `SELECT reviewee_organization_id, AVG(rating)::numeric(3, 2) AS rating_avg, COUNT(*)::int AS rating_cnt
+         FROM organization_reviews
+         WHERE reviewee_organization_id = ANY($1::uuid[])
+         GROUP BY reviewee_organization_id`,
+        [sellerOrgIds],
+      ) : { rows: [] };
+      const ratingStats = new Map(reviewsResult.rows.map((row) => [row.reviewee_organization_id, { average: Number(row.rating_avg), count: Number(row.rating_cnt) }]));
+
       const parts = await loadOfferParts(pool, result.rows.map((row) => row.id));
       const comparisonCurrency = config.defaultCurrency;
       const rates = await loadComparisonRates(pool, result.rows.map((offer) => offer.currency), { quoteCurrency: comparisonCurrency, fetchImpl: comparisonRateFetch });
@@ -1633,6 +1643,7 @@ export function createMarketplaceRouter({ pool, storage = null, comparisonRateFe
           const total = exchangeRate ? convertMinorUnits(option.estimatedTotalMinor, exchangeRate.rate, offer.currency, comparisonCurrency) : null;
           return { ...option, comparisonTotalMinor: total, comparisonPerTravellerMinor: total != null && option.travellers > 0 ? Math.round(total / option.travellers) : null };
         });
+        const rating = ratingStats.get(offer.seller_organization_id);
         return {
           ...dto,
           requestCode: ownedRequest.rows[0].request_code,
@@ -1642,6 +1653,8 @@ export function createMarketplaceRouter({ pool, storage = null, comparisonRateFe
           comparisonPerTravellerMinor,
           comparisonCurrency,
           exchangeRate,
+          sellerRatingAverage: rating ? rating.average : null,
+          sellerRatingCount: rating ? rating.count : 0,
           comparisonLabels: [],
         };
       });
@@ -1649,6 +1662,15 @@ export function createMarketplaceRouter({ pool, storage = null, comparisonRateFe
       if (validPrices.length === offers.length && offers.length) {
         const lowest = Math.min(...validPrices.map((offer) => offer.comparisonTotalMinor));
         for (const offer of offers) if (offer.comparisonTotalMinor === lowest) offer.comparisonLabels.push('lowest');
+      }
+      const ratedOffers = offers.filter((offer) => offer.sellerRatingAverage != null && offer.sellerRatingCount >= 1 && offer.sellerRatingAverage >= 4.0);
+      if (ratedOffers.length) {
+        const highestRating = Math.max(...ratedOffers.map((offer) => offer.sellerRatingAverage));
+        for (const offer of offers) {
+          if (offer.sellerRatingAverage != null && offer.sellerRatingAverage === highestRating && offer.sellerRatingCount >= 1) {
+            offer.comparisonLabels.push('best_rated');
+          }
+        }
       }
       const hasInclusionData = offers.some((offer) => offer.inclusions.length || offer.exclusions.length);
       if (hasInclusionData) {

@@ -2088,7 +2088,7 @@ test('agency comparison converts to INR with a dated rate and derives lowest, mo
   assert.ok(usd.comparisonLabels.includes('most_inclusive'));
   assert.ok((await pool.query('SELECT COUNT(*)::int AS count FROM comparison_exchange_rates')).rows[0].count >= 2);
   const reference = await (await fetch(`${baseUrl}/v1/reference-data`)).json();
-  assert.deepEqual(reference.comparisonLabels.map((item) => item.value), ['lowest', 'most_inclusive']);
+  assert.deepEqual(reference.comparisonLabels.map((item) => item.value), ['lowest', 'best_rated', 'most_inclusive']);
 });
 
 test('agencies split an award across sellers and can undo it within the window before booking', async (context) => {

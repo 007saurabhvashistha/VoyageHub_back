@@ -4,9 +4,9 @@ import multer from 'multer';
 import { z } from 'zod';
 import { config } from '../config/index.js';
 import { loadSession, requireActiveAccount, requireCsrf, requireMfaForPlatformAdmin } from './auth.routes.js';
-import { alertDeliveryModes, capabilities, destinationKinds } from '../config/referenceData.js';
+import { alertDeliveryModes, capabilities, destinationKinds, ownershipProofTypes } from '../config/referenceData.js';
 import { requireCapability } from '../services/permissions.js';
-import { createProperty, listProperties, propertyDto, propertyInputSchema, propertyUpdateSchema, updateProperty } from '../services/hotelProperties.js';
+import { createProperty, linkPropertyProof, listProperties, propertyDto, propertyInputSchema, propertyUpdateSchema, updateProperty } from '../services/hotelProperties.js';
 import { detectAllowedFileType, displayFilename, downloadDisposition, sha256Hex } from '../services/verificationDocuments.js';
 import { createRateLimiter } from '../utils/rateLimit.js';
 import { parseWith } from '../utils/validation.js';
@@ -69,6 +69,38 @@ export function createHotelPropertyRouter({ pool, storage = null }) {
     try {
       await client.query('BEGIN');
       const result = await updateProperty(client, { organizationId: request.auth.organization_id, propertyId: request.params.propertyId, input: input.data });
+      if (result.error) {
+        await client.query('ROLLBACK');
+        return fail(response, result.status, result.code, result.error);
+      }
+      await client.query('COMMIT');
+      return response.json({ property: await propertyDto(client, result.property) });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      return next(error);
+    } finally {
+      client.release();
+    }
+  });
+
+  const propertyProofSchema = z.object({
+    document_id: z.uuid('Choose a valid uploaded property proof document.'),
+    proof_type: z.enum(ownershipProofTypes.map((item) => item.value), { error: 'Choose a valid proof of ownership type.' }),
+  });
+
+  router.post('/:propertyId/proof', requireCapability(capabilities.profileManage), async (request, response, next) => {
+    if (!z.uuid().safeParse(request.params.propertyId).success) return fail(response, 404, 'PROPERTY_NOT_FOUND', 'Hotel was not found.');
+    const input = parseWith(propertyProofSchema, request.body);
+    if (input.error) return fail(response, 400, 'VALIDATION_ERROR', input.error);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await linkPropertyProof(client, {
+        organizationId: request.auth.organization_id,
+        propertyId: request.params.propertyId,
+        documentId: input.data.document_id,
+        proofType: input.data.proof_type,
+      });
       if (result.error) {
         await client.query('ROLLBACK');
         return fail(response, result.status, result.code, result.error);

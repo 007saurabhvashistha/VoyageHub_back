@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { decideProperty, propertyDto } from '../services/hotelProperties.js';
+import { decideProperty, decidePropertyOwnership, propertyDto } from '../services/hotelProperties.js';
 import { verificationDecisionSchema } from '../services/verificationDocuments.js';
 import { parseWith } from '../utils/validation.js';
 import { requireCsrf } from './auth.routes.js';
@@ -49,4 +49,32 @@ export function registerHotelPropertyAdminRoutes(router, pool) {
       client.release();
     }
   });
+
+  const ownershipDecisionSchema = z.object({
+    decision: z.enum(['verified', 'rejected'], { error: 'Decision must be verified or rejected.' }),
+    reason: z.string().trim().min(3, 'Enter a review reason (3 to 500 characters).').max(500, 'Enter a review reason (3 to 500 characters).'),
+  });
+
+  router.post('/hotel-properties/:propertyId/ownership-review', requireCsrf, async (request, response, next) => {
+    if (!z.uuid().safeParse(request.params.propertyId).success) return fail(response, 404, 'PROPERTY_NOT_FOUND', 'Hotel property was not found.');
+    const input = parseWith(ownershipDecisionSchema, request.body);
+    if (input.error) return fail(response, 400, 'VALIDATION_ERROR', input.error);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const property = await decidePropertyOwnership(client, { propertyId: request.params.propertyId, decision: input.data.decision, reason: input.data.reason, reviewerId: request.auth.user_id });
+      if (!property) {
+        await client.query('ROLLBACK');
+        return fail(response, 404, 'PROPERTY_NOT_FOUND', 'Hotel property was not found.');
+      }
+      await client.query('COMMIT');
+      return response.json({ property: await propertyDto(client, property) });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      return next(error);
+    } finally {
+      client.release();
+    }
+  });
 }
+

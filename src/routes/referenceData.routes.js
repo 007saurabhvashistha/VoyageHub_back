@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { config, countryList, currencyList, isCountryCode } from '../config/index.js';
-import { agencyVerificationStatuses, alertDeliveryModes, bookingChangeStatuses, bookingChangeTypes, bookingRatingScale, bookingStatuses, businessTypes, comparisonLabels, coverageModes, destinationKinds, destinationParentKinds, documentScanStatuses, groupTypes, guestAccessActions, hotelCategories, hotelFacilities, hotelOwnershipCheckStatuses, hotelPropertyStatuses, hotelRoomHoldStatuses, legalDocumentTypes, matchTypes, mealPlans, memberRoles, negotiationKinds, negotiationStatuses, offerInclusions, offerLineItemTypes, operationRunKinds, reportCategories, reportTargetTypes, requestVisibilities, requirementTypes, serviceTypes, travellerTypes, verificationDocumentTypes, webhookDeliveryStatuses, webhookEventTypes } from '../config/referenceData.js';
+import { agencyVerificationStatuses, alertDeliveryModes, bookingChangeStatuses, bookingChangeTypes, bookingRatingScale, bookingStatuses, businessTypes, comparisonLabels, coverageModes, destinationKinds, destinationParentKinds, documentScanStatuses, groupTypes, guestAccessActions, hotelCategories, hotelFacilities, hotelOwnershipCheckStatuses, hotelPropertyStatuses, hotelRoomHoldStatuses, legalDocumentTypes, matchTypes, mealPlans, memberRoles, negotiationKinds, negotiationStatuses, offerInclusions, offerLineItemTypes, operationRunKinds, ownershipProofTypes, reportCategories, reportTargetTypes, requestVisibilities, requirementTypes, serviceTypes, travellerTypes, verificationDocumentTypes, webhookDeliveryStatuses, webhookEventTypes } from '../config/referenceData.js';
 import { destinationDto, listChildren, listCountryRoots, loadLevelLabels, searchDestinations } from '../services/destinations.js';
 import { propertyDestinationKinds } from '../services/hotelProperties.js';
 import { getMaxOffersPerRequest, getSetting } from '../services/platformSettings.js';
@@ -32,6 +32,7 @@ export function createReferenceDataRouter({ pool, cookieName }) {
     alertDeliveryModes,
     hotelPropertyStatuses,
     hotelOwnershipCheckStatuses,
+    ownershipProofTypes,
     hotelFacilities,
     hotelRoomHoldStatuses,
     hotelPropertyDestinationKinds: propertyDestinationKinds,

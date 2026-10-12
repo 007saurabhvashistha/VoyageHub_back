@@ -90,9 +90,19 @@ export const hotelRoomHoldStatuses = [
 ];
 
 export const hotelOwnershipCheckStatuses = [
-  { value: 'pending', label: 'Awaiting hotel review' },
-  { value: 'verified', label: 'Ownership evidence reviewed' },
-  { value: 'rejected', label: 'Ownership evidence rejected' },
+  { value: 'pending', label: 'Awaiting proof upload' },
+  { value: 'evidence_ready', label: 'Proof submitted, awaiting admin review' },
+  { value: 'verified', label: 'Ownership verified' },
+  { value: 'rejected', label: 'Ownership proof rejected' },
+];
+
+export const ownershipProofTypes = [
+  { value: 'property_deed', label: 'Property deed or title' },
+  { value: 'lease_agreement', label: 'Lease or rental agreement' },
+  { value: 'utility_bill', label: 'Electricity / utility bill' },
+  { value: 'tax_receipt', label: 'Property tax receipt' },
+  { value: 'management_contract', label: 'Hotel management contract' },
+  { value: 'other', label: 'Other official ownership proof' },
 ];
 
 export const audienceFor = (requirementType) => requirementTypes.find((item) => item.value === requirementType)?.audience ?? null;
@@ -255,6 +265,7 @@ export const bookingChangeStatuses = [
 
 export const comparisonLabels = [
   { value: 'lowest', label: 'Lowest total' },
+  { value: 'best_rated', label: 'Best rated' },
   { value: 'most_inclusive', label: 'Most inclusive' },
 ];
 
